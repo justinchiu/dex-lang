@@ -93,12 +93,13 @@ def forward3 (x: Observations): (Batch => Float) =
   withState (for batch. logsumexp firstAlpha.batch) $ \evidence.
     withState (for batch. softmax firstAlpha.batch) $ \alpha.
       for time.
+        -- Transition and sum over prev states
         pState = log $ (get alpha) ** pTrans
-        -- Transition then sum over previous timestep
+        -- Incorporate emissions
         thisAlpha = for batch next. emit.next.(xs.batch.time@Vocab) + pState.batch.next
-        -- Sum over states and accumulate evidence
+        -- Sum over current states and accumulate evidence
         evidence := for batch. (get evidence).batch + logsumexp thisAlpha.batch
-        -- Renormalize, not necessary in log space
+        -- Renormalize for stability
         alpha := for batch. softmax thisAlpha.batch
     get evidence
 
