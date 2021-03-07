@@ -43,7 +43,7 @@ thisAlpha = for batch next. emit.next.((words.(1@Time).batch)@Vocab) + (logsumex
   for prev. firstAlpha.batch.prev + trans.prev.next)
 :t thisAlpha
 
--- Inference: Forward Algo
+-- Forward Algo: renormalize at each timestep
 def forward (x: Observations): (Batch => Float) =
   -- time == 0
   firstAlpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
@@ -64,6 +64,7 @@ def forward (x: Observations): (Batch => Float) =
 evidence = forward words
 :t evidence
 
+-- Forward Algo: simple
 def forward2 (x: Observations): (Batch => Float) =
   -- time == 0
   firstAlpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
@@ -74,10 +75,32 @@ def forward2 (x: Observations): (Batch => Float) =
       -- Transition then sum over previous timestep
       alpha := for batch next. emit.next.(xs.batch.time@Vocab) + (logsumexp $
         for prev. (get alpha).batch.prev + trans.prev.next)
-      -- Sum over states and accumulate evidence
+    -- Sum over states
     for batch. logsumexp (get alpha).batch
 
 evidence2 = forward2 words
 :t evidence2
 
 evidence ~~ evidence2
+
+-- Forward Algo: matmul
+def forward3 (x: Observations): (Batch => Float) =
+  pTrans = exp trans
+  -- time == 0
+  firstAlpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
+  -- time > 0
+  xs = slice x 1 _
+  withState (for batch. logsumexp firstAlpha.batch) $ \evidence.
+    withState (for batch. softmax firstAlpha.batch) $ \alpha.
+      for time.
+        pState = log $ (get alpha) ** pTrans
+        -- Transition then sum over previous timestep
+        thisAlpha = for batch next. emit.next.(xs.batch.time@Vocab) + pState.batch.next
+        -- Sum over states and accumulate evidence
+        evidence := for batch. (get evidence).batch + logsumexp thisAlpha.batch
+        -- Renormalize, not necessary in log space
+        alpha := for batch. softmax thisAlpha.batch
+    get evidence
+
+evidence3 = forward3 words
+evidence ~~ evidence3
