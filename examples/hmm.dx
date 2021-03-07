@@ -1,0 +1,107 @@
+' # HMM
+
+States = Fin 128
+Vocab = Fin 2048
+
+[startKey, transKey, emitKey] = splitKey $ newKey 0
+
+-- Arbitrary typeclass for generating arbitrary inputs
+start: States => Float = logsoftmax $ arb startKey
+trans: States => States => Float = for i. logsoftmax $ arb transKey
+emit: States => Vocab => Float = for i. logsoftmax $ arb emitKey
+
+-- Sanity checks
+:t start
+:t trans
+:t emit
+
+logsumexp start == zero
+(for i. logsumexp trans.i) == zero
+(for i. logsumexp emit.i) == zero
+
+-- Sample observations
+Batch = Fin 16
+Time = Fin 32
+Observations = Time => Batch => Int
+[wordKey] = splitKey $ newKey 1 -- trailing comma not allowed?
+words: Observations = for time batch.
+  min 2048 $ (ordinal batch) * (ordinal time) + (ordinal time)
+-- how to use Vocab to set max?
+-- better would be to just sample from cat
+
+:t words
+maximum $ for (i, j). words.i.j
+minimum $ for (i, j). words.i.j
+
+-- Test types
+:t start
+:t emit
+firstAlpha = for batch. for z. start.z + emit.z.(words.(0@Time).batch@Vocab)
+:t firstAlpha
+:t for batch. logsoftmax firstAlpha.batch
+thisAlpha = for batch next. emit.next.((words.(1@Time).batch)@Vocab) + (logsumexp $
+  for prev. firstAlpha.batch.prev + trans.prev.next)
+:t thisAlpha
+
+-- Inference: Forward Algo
+def forward (x: Observations): (Batch => Float) =
+  -- time == 0
+  firstAlpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
+  -- time > 0
+  xs = slice x 1 _
+  withState (for batch. logsumexp firstAlpha.batch) $ \evidence.
+    withState (for batch. logsoftmax firstAlpha.batch) $ \alpha.
+      for time.
+        -- Transition then sum over previous timestep
+        thisAlpha = for batch next. emit.next.(xs.batch.time@Vocab) + (logsumexp $
+          for prev. (get alpha).batch.prev + trans.prev.next)
+        -- Sum over states and accumulate evidence
+        evidence := for batch. (get evidence).batch + logsumexp thisAlpha.batch
+        -- Renormalize, not necessary in log space
+        alpha := for batch. logsoftmax thisAlpha.batch
+    get evidence
+
+evidence = forward words
+:t evidence
+
+def forward2 (x: Observations): (Batch => Float) =
+  -- time == 0
+  firstAlpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
+  -- time > 0
+  xs = slice x 1 _
+  withState (for batch. logsumexp firstAlpha.batch) $ \evidence.
+    withState firstAlpha $ \alpha.
+      for time.
+        -- Transition then sum over previous timestep
+        thisAlpha = for batch next. emit.next.(xs.batch.time@Vocab) + (logsumexp $
+          for prev. (get alpha).batch.prev + trans.prev.next)
+        -- Sum over states and accumulate evidence
+        evidence := for batch. logsumexp thisAlpha.batch
+        alpha := thisAlpha
+    get evidence
+
+evidence2 = forward2 words
+:t evidence2
+
+evidence ~~ evidence2
+
+def forward3 (x: Observations): (Batch => Float) =
+  -- time == 0
+  firstAlpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
+  -- time > 0
+  xs = slice x 1 _
+  withState (for batch. logsumexp firstAlpha.batch, firstAlpha) $ \state.
+    for time.
+      (evidence, alpha) = get state
+      -- Transition then sum over previous timestep
+      thisAlpha = for batch next. emit.next.(xs.batch.time@Vocab) + (logsumexp $
+        for prev. alpha.batch.prev + trans.prev.next)
+      -- Sum over states and accumulate evidence
+      thisEvidence = for batch. logsumexp thisAlpha.batch
+      state := (thisEvidence, thisAlpha)
+    fst $ get state
+
+evidence3 = forward3 words
+:t evidence3
+
+evidence ~~ evidence3
