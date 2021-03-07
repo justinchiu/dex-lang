@@ -69,39 +69,15 @@ def forward2 (x: Observations): (Batch => Float) =
   firstAlpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
   -- time > 0
   xs = slice x 1 _
-  withState (for batch. logsumexp firstAlpha.batch) $ \evidence.
-    withState firstAlpha $ \alpha.
-      for time.
-        -- Transition then sum over previous timestep
-        thisAlpha = for batch next. emit.next.(xs.batch.time@Vocab) + (logsumexp $
-          for prev. (get alpha).batch.prev + trans.prev.next)
-        -- Sum over states and accumulate evidence
-        evidence := for batch. logsumexp thisAlpha.batch
-        alpha := thisAlpha
-    get evidence
+  withState firstAlpha $ \alpha.
+    for time.
+      -- Transition then sum over previous timestep
+      alpha := for batch next. emit.next.(xs.batch.time@Vocab) + (logsumexp $
+        for prev. (get alpha).batch.prev + trans.prev.next)
+      -- Sum over states and accumulate evidence
+    for batch. logsumexp (get alpha).batch
 
 evidence2 = forward2 words
 :t evidence2
 
 evidence ~~ evidence2
-
-def forward3 (x: Observations): (Batch => Float) =
-  -- time == 0
-  firstAlpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
-  -- time > 0
-  xs = slice x 1 _
-  withState (for batch. logsumexp firstAlpha.batch, firstAlpha) $ \state.
-    for time.
-      (evidence, alpha) = get state
-      -- Transition then sum over previous timestep
-      thisAlpha = for batch next. emit.next.(xs.batch.time@Vocab) + (logsumexp $
-        for prev. alpha.batch.prev + trans.prev.next)
-      -- Sum over states and accumulate evidence
-      thisEvidence = for batch. logsumexp thisAlpha.batch
-      state := (thisEvidence, thisAlpha)
-    fst $ get state
-
-evidence3 = forward3 words
-:t evidence3
-
-evidence ~~ evidence3
