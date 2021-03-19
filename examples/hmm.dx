@@ -105,3 +105,7 @@ def forward3 (x: Observations): (Batch => Float) =
 
 evidence3 = forward3 words
 evidence ~~ evidence3
+
+
+-- Hierarchical HMM
+Layers = Fin 3
