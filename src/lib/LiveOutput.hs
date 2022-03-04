@@ -27,13 +27,15 @@ import System.Console.ANSI
 import System.Directory
 import System.IO
 
+import Paths_dex  (getDataFileName)
+
 import Cat
 import Syntax
 import Actor
-import Parser
 import TopLevel
 import RenderHtml
 import PPrint
+import Parser
 
 type NodeId = Int
 data WithId a = WithId { getNodeId :: NodeId
@@ -87,7 +89,8 @@ runDriver cfg env =
 
 evalSource :: SourceContents -> DriverM ()
 evalSource source = withLocalTopState do
-    (evaluated, remaining) <- tryEvalBlocksCached $ parseProg source
+    let UModule _ _ blocks = parseUModule Main source
+    (evaluated, remaining) <- tryEvalBlocksCached blocks
     remaining' <- mapM makeNewBlockId remaining
     updateResultList $ map getNodeId $ evaluated ++ remaining'
     mapM_ evalBlock remaining'
@@ -108,12 +111,10 @@ evalBlock :: WithId SourceBlock -> DriverM ()
 evalBlock (WithId blockId block) = do
   oldState <- gets fst
   opts <- asks fst
-  (result, maybeNewState) <- liftIO $ evalSourceBlockIO opts (withoutId oldState) block
+  (result, s) <- liftIO $ evalSourceBlockIO opts (withoutId oldState) block
   resultsChan <- asks snd
   resultsChan `send` oneResult blockId result
-  newState <- case maybeNewState of
-    Nothing -> return $ oldState
-    Just s -> makeNewStateId s
+  newState <- makeNewStateId s
   updateTopState newState
   insertCache (block, oldState) (blockId, newState)
 
@@ -175,8 +176,9 @@ serveResults results request respond = do
     _ -> respond $ responseLBS status404
            [("Content-Type", "text/plain")] "404 - Not Found"
   where
-    respondWith fname ctype = respond $ responseFile status200
-                               [("Content-Type", ctype)] fname Nothing
+    respondWith dataFname ctype = do
+      fname <- getDataFileName dataFname
+      respond $ responseFile status200 [("Content-Type", ctype)] fname Nothing
 
 resultStream :: ToJSON a => ReqChan a -> StreamingBody
 resultStream resultsRequest write flush = runActor $ do
@@ -303,3 +305,21 @@ instance Eq (WithId a) where
 
 instance Ord (WithId a) where
   compare (WithId x _) (WithId y _) = compare x y
+
+-- === some handy monoids ===
+
+data SetVal a = Set a | NotSet
+newtype MonMap k v = MonMap (M.Map k v)  deriving (Show, Eq)
+
+instance Semigroup (SetVal a) where
+  x <> NotSet = x
+  _ <> Set x  = Set x
+
+instance Monoid (SetVal a) where
+  mempty = NotSet
+
+instance (Ord k, Semigroup v) => Semigroup (MonMap k v) where
+  MonMap m <> MonMap m' = MonMap $ M.unionWith (<>) m m'
+
+instance (Ord k, Semigroup v) => Monoid (MonMap k v) where
+  mempty = MonMap mempty

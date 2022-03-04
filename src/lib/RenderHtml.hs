@@ -30,7 +30,7 @@ import Err
 pprintHtml :: ToMarkup a => a -> String
 pprintHtml x = renderHtml $ toMarkup x
 
-progHtml :: LitProg -> String
+progHtml :: (ToMarkup a, ToMarkup b) => [(a, b)] -> String
 progHtml blocks = renderHtml $ wrapBody $ map toHtmlBlock blocks
   where toHtmlBlock (block,result) = toMarkup block <> toMarkup result
 

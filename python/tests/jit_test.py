@@ -57,15 +57,14 @@ class JITTest(unittest.TestCase):
 
   def test_polymorphic_array_1d(self):
     m = dex.Module(dedent("""
-    def addTwo (n: Int) ?-> (x: (Fin n)=>Float) : (Fin n)=>Float = for i. x.i + 2.0
+    def addTwo {n} (x: (Fin n)=>Float) : (Fin n)=>Float = for i. x.i + 2.0
     """))
     check_atom(m.addTwo, lambda x: x + 2,
                [(np.arange(l, dtype=np.float32),) for l in (2, 5, 10)])
 
   def test_polymorphic_array_2d(self):
     m = dex.Module(dedent("""
-    def myTranspose (n: Int) ?-> (m: Int) ?->
-                    (x : (Fin n)=>(Fin m)=>Float) : (Fin m)=>(Fin n)=>Float =
+    def myTranspose {n m} (x : (Fin n)=>(Fin m)=>Float) : (Fin m)=>(Fin n)=>Float =
       for i j. x.j.i
     """))
     check_atom(m.myTranspose, lambda x: x.T,
@@ -75,7 +74,7 @@ class JITTest(unittest.TestCase):
   def test_tuple_return(self):
     dex_func = dex.eval(r"\x: ((Fin 10) => Float). (x, 2. .* x, 3. .* x)")
     reference = lambda x: (x, 2 * x, 3 * x)
-    
+
     x = np.arange(10, dtype=np.float32)
 
     dex_output = dex_func.compile()(x)

@@ -1,7 +1,8 @@
+import linalg
 import plot
 
 -- Conjugate gradients solver
-def solve (mat:m=>m=>Float) (b:m=>Float) : m=>Float =
+def solve' {m} (mat:m=>m=>Float) (b:m=>Float) : m=>Float =
   x0 = for i:m. 0.0
   ax = mat **. x0
   r0 = b - ax
@@ -16,11 +17,16 @@ def solve (mat:m=>m=>Float) (b:m=>Float) : m=>Float =
        (x', r', p')
   xOut
 
+def chol_solve {m} (l:LowerTriMat m Float) (b:m=>Float) : m=>Float =
+    b' = forward_substitute l b
+    u = transposeLowerToUpper l
+    backward_substitute u b'
+
 ' # Kernel ridge regression
 
-' To learn a function $f_{true}: \mathcal{X} \to \mathbb R$ 
+' To learn a function $f_{true}: \mathcal{X} \to \mathbb R$
 from data $(x_1, y_1),\dots,(x_N, y_N)\in \mathcal{X}\times\mathbb R$,\
-in kernel ridge regression the hypothesis takes the form 
+in kernel ridge regression the hypothesis takes the form
 $f(x)=\sum_{i=1}^N \alpha_i k(x_i, x)$,\
 where $k:\mathcal X \times \mathcal X \to \mathbb R$ is a positive semidefinite kernel function.\
 The optimal coefficients are found by solving a linear system $\alpha=G^{-1}y$,\
@@ -38,9 +44,9 @@ xs : Nx=>Float = for i. rand (ixkey k1 i)
 ys : Nx=>Float = for i. trueFun xs.i + noise * randn (ixkey k2 i)
 
 -- Kernel ridge regression
-def regress (kernel: a -> a -> Float) (xs: Nx=>a) (ys: Nx=>Float) : a -> Float =
+def regress {a} (kernel: a -> a -> Float) (xs: Nx=>a) (ys: Nx=>Float) : a -> Float =
     gram = for i j. kernel xs.i xs.j + select (i==j) 0.0001 0.0
-    alpha = solve gram ys
+    alpha = solve' gram ys
     predict = \x. sum for i. alpha.i * kernel xs.i x
     predict
 
@@ -58,4 +64,36 @@ preds = map predict xtest
 > <html output>
 
 :html showPlot $ xyPlot xtest preds
+> <html output>
+
+' # Gaussian process regression
+
+' GP regression (kriging) works in a similar way. Compared with kernel ridge regression, GP regression assumes Gaussian distributed prior. This, combined
+with the Bayes rule, gives the variance of the prediction.
+
+' In this implementation, the conjugate gradient solver is replaced with the
+cholesky solver from `lib/linalg.dx` for efficiency.
+
+def gp_regress {n a} (kernel: a -> a -> Float) (xs: n=>a) (ys: n=>Float)
+    : (a -> (Float&Float)) =
+    noise_var = 0.0001
+    gram = for i j. kernel xs.i xs.j
+    c = chol (gram + eye *. noise_var)
+    alpha = chol_solve c ys
+    predict = \x.
+        k' = for i. kernel xs.i x
+        mu = sum for i. alpha.i * k'.i
+        alpha' = chol_solve c k'
+        var = kernel x x + noise_var - sum for i. k'.i * alpha'.i
+        (mu, var)
+    predict
+
+gp_predict = gp_regress (rbf 0.2) xs ys
+
+(gp_preds, vars) = unzip (map gp_predict xtest)
+
+:html showPlot $ xycPlot xtest gp_preds (map sqrt vars)
+> <html output>
+
+:html showPlot $ xyPlot xtest vars
 > <html output>
