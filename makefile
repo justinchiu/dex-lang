@@ -30,7 +30,7 @@ endif
 
 # --- building Dex ---
 
-CFLAGS := -fPIC
+CFLAGS := $(CFLAGS) -fPIC
 
 # CUDA
 ifneq (,$(wildcard /usr/local/cuda/include/cuda.h))
