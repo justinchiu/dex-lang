@@ -49,7 +49,7 @@ endif
 
 possible-clang-locations := clang++-9 clang++-10 clang++-11 clang++-12 clang++
 
-CLANG := clang++
+CLANG := clang++-12
 
 ifeq (1,$(DEX_LLVM_HEAD))
 ifeq ($(PLATFORM),Darwin)
