@@ -1140,7 +1140,7 @@ instance (HoistableE e, AlphaEqE e) => Eq (EKey e n) where
       ClosedWithScope scope (PairE x' y') ->
         runScopeReaderM scope $ alphaEq x' y'
 
-instance (AlphaEqE e, AlphaHashableE e) => Hashable (EKey e n) where
+instance (HoistableE e, AlphaEqE e, AlphaHashableE e) => Hashable (EKey e n) where
   hashWithSalt salt (EKey e) = alphaHashWithSalt salt e
 
 instance SubstE v   e => SubstE v   (EKey e)
@@ -1151,7 +1151,7 @@ instance Store (e n) => Store (EKey e n)
 data EMap (k::E) (v::E) (n::S) = EMap (HM.HashMap (EKey k n) (v n))
                                  deriving (Show, Generic)
 
-eMapSingleton :: (AlphaEqE k, AlphaHashableE k) => k n -> v n -> EMap k v n
+eMapSingleton :: (HoistableE k, AlphaEqE k, AlphaHashableE k) => k n -> v n -> EMap k v n
 eMapSingleton k v = EMap $ HM.singleton (EKey k) v
 
 eMapToList :: EMap k v n -> [(k n, v n)]
@@ -1160,7 +1160,7 @@ eMapToList (EMap m) = [(k, v) | (EKey k, v) <- HM.toList m]
 eMapFromList :: (AlphaEqE k, AlphaHashableE k, HoistableE k) => [(k n, v n)] -> EMap k v n
 eMapFromList xs = EMap $ HM.fromList [(EKey k, v) | (k, v) <- xs]
 
-eSetSingleton :: (AlphaEqE k, AlphaHashableE k) => k n -> ESet k n
+eSetSingleton :: (AlphaEqE k, AlphaHashableE k, HoistableE k) => k n -> ESet k n
 eSetSingleton k = eMapSingleton k UnitE
 
 eSetToList :: ESet k n -> [k n]
