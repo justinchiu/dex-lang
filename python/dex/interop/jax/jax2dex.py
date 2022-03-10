@@ -130,7 +130,7 @@ class Lam(Expr):
     expr = self.block.expr.pprint()
     newline = '\n' if decls else ''
     block = textwrap.indent(f'{decls}{newline}{expr}', '  ')
-    return f'\ {self.name}:{ty}.\n{block}'
+    return f'\\ {self.name}:{ty}.\n{block}'
 
 @dataclass
 class For(Expr):
@@ -207,15 +207,19 @@ def make_jaxpr(fun: Callable, in_tree: PyTreeDef,
   jaxpr_, _, consts = pe.trace_to_jaxpr_dynamic(flat_fun, in_avals, debug,
                                                 keep_inputs=keep_inputs)
   jaxpr = pe.convert_constvars_jaxpr(jaxpr_)
+  consts = [_canonicalize_arg(c) for c in consts]
   return jaxpr, consts, out_tree()
+
+def _canonicalize_arg(arg):
+  return np.asarray(arg, dtype=dtypes.dtype(arg, canonicalize=True), order='C')
 
 dex_call_p = core.Primitive('dex_call')
 dex_call_p.multiple_results = True
 
 @dex_call_p.def_impl
 def dex_call_impl(*args, jaxpr):
-  dex_executable(jaxpr)
-  return dex_executable(jaxpr)(*args),  # TODO tuples ignored?
+  cargs_gen = (_canonicalize_arg(arg) for arg in args)
+  return dex_executable(jaxpr)(*cargs_gen),  # TODO tuples ignored?
 
 @cache()
 def dex_executable(jaxpr: core.Jaxpr) -> Callable:
@@ -324,8 +328,12 @@ def _broadcasting_binop(name: str, ctx, x, y):
   return out
 
 def _make_bcast_expr(idx_names, out_shape, in_shape, x):
+  ndim = len(in_shape)
+  if not ndim:
+    return x
   idxs = [unitIdx if in_size != out_size else Var(idx_name)
-          for idx_name, out_size, in_size in zip(idx_names, out_shape, in_shape)]
+          for idx_name, out_size, in_size
+          in zip(idx_names[-ndim:], out_shape[-ndim:], in_shape)]
   return Idx(x, tuple(idxs))
 unitIdx = App(App(Var('unsafeFromOrdinal'), FinType(Literal(1))), Literal(0))
 
@@ -338,6 +346,8 @@ expr_makers[lax.max_p] = partial(_broadcasting_binop, 'max')
 def _squeeze_lowering(ctx, x, dimensions):
   in_aval, = ctx.avals_in
   out_aval, = ctx.avals_out
+  if not out_aval.shape:
+    return Idx(x, (unitIdx,))
   idx_names, idx_tys = unzip2((ctx.fresh('i'), FinType(Literal(sz)))
                               for sz in out_aval.shape)
   idx_name = iter(idx_names)
@@ -368,9 +378,14 @@ def _dot_general_lowering(ctx, lhs, rhs, dimension_numbers, precision, preferred
   if preferred_element_type is not None:
     raise NotImplementedError("dtype selection in dot_general not implemented")
   lhs_aval, rhs_aval = ctx.avals_in
-  # Support at least matrix multiply
-  if lhs_aval.ndim == rhs_aval.ndim == 2 and dimension_numbers == (((1,), (0,)), ((), ())):
+  # Matrix-matrix multiply
+  if (lhs_aval.ndim == 2 and rhs_aval.ndim == 2 and
+      dimension_numbers == (((1,), (0,)), ((), ()))):
     return BinOp(lhs, '**', rhs)
+  # Matrix-vector multiply
+  if (lhs_aval.ndim == 2 and rhs_aval.ndim == 1 and
+      dimension_numbers == (((1,), (0,)), ((), ()))):
+    return BinOp(lhs, '**.', rhs)
   raise NotImplementedError("Unimplemented dot_general kind")
 expr_makers[lax.dot_general_p] = _dot_general_lowering
 
