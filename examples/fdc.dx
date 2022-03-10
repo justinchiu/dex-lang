@@ -1,0 +1,30 @@
+'# Functional Differential Geometry
+Implementation of
+[Functional Differential Geometry](https://mitpress.mit.edu/books/functional-differential-geometry).
+
+'## Playing around with gradients
+First, let's experiment with taking gradients in $\R^n$
+
+import plot
+import png
+
+def quadratic (x: Float): Float = pow x 2
+
+N = Fin 100
+low: Float = -5
+high: Float = 5
+
+xs = linspace N low high
+ys = for i. quadratic xs.i
+:html showPlot $ yPlot ys
+
+dquadratic = grad quadratic
+:html showPlot $ yPlot $ for i. dquadratic xs.i
+
+def cubic (x: Float): Float = pow x 3
+dcubic = grad cubic
+d2cubic = grad dcubic
+:html showPlot $ yPlot $ for i. cubic xs.i
+:html showPlot $ yPlot $ for i. dcubic xs.i
+:html showPlot $ yPlot $ for i. d2cubic xs.i
+
