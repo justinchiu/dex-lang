@@ -6,6 +6,8 @@
 
 resolver: lts-18.23
 
+arch: aarch64
+
 packages:
 - .
 
@@ -23,9 +25,11 @@ extra-deps:
 
 extra-include-dirs:
   - /opt/homebrew/opt/llvm@12/include
+  - /opt/homebrew/opt/cmark/include
 extra-lib-dirs:
   - /opt/homebrew/opt/llvm@12/lib
-with-gcc: /opt/homebrew/opt/llvm@12/bin/clang++
+  - /opt/homebrew/opt/cmark/lib
+with-gcc: /opt/homebrew/opt/llvm@12/bin/clang
 
 flags:
   llvm-hs:
