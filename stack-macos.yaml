@@ -21,6 +21,12 @@ extra-deps:
   - store-core-0.4.4.4@sha256:a19098ca8419ea4f6f387790e942a7a5d0acf62fe1beff7662f098cfb611334c,1430
   - th-utilities-0.2.4.1@sha256:b37d23c8bdabd678aee5a36dd4373049d4179e9a85f34eb437e9cd3f04f435ca,1869
 
+extra-include-dirs:
+  - /opt/homebrew/opt/llvm@12/include
+extra-lib-dirs:
+  - /opt/homebrew/opt/llvm@12/lib
+with-gcc: /opt/homebrew/opt/llvm@12/bin/clang++
+
 flags:
   llvm-hs:
     shared-llvm: false
