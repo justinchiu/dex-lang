@@ -5,21 +5,30 @@
 -- https://developers.google.com/open-source/licenses/bsd
 
 module Parser (Parser, parseit, parseUModule, parseUModuleDeps,
-               finishUModuleParse, parseData, preludeImportBlock,
-               parseTopDeclRepl, uint, withSource,
-               emptyLines, brackets, symbol, symChar, keyWordStrs) where
+               finishUModuleParse, preludeImportBlock,
+               parseTopDeclRepl, withSource,
+               symbol, symChar, keyWordStrs, showPrimName) where
 
 import Control.Monad
 import Control.Monad.Combinators.Expr
 import Control.Monad.Reader
+import Data.Char
+import Data.Text (Text)
+import Data.Text          qualified as T
+import Data.Text.Encoding qualified as T
 import Text.Megaparsec hiding (Label, State)
 import Text.Megaparsec.Char hiding (space, eol)
+import Data.HashSet qualified as HS
 import qualified Text.Megaparsec.Char as MC
-import Data.ByteString.UTF8 (toString)
+import qualified Data.Map.Strict       as M
+import Data.Tuple
 import Data.Functor
 import Data.Foldable
+import Data.List.NonEmpty (NonEmpty (..))
+import qualified Data.Scientific as Scientific
 import Data.Maybe (fromMaybe)
 import Data.Void
+import Data.Word
 import qualified Data.Set as S
 import Data.String (IsString, fromString)
 import qualified Text.Megaparsec.Char.Lexer as L
@@ -28,27 +37,30 @@ import qualified Text.Megaparsec.Debug
 import Err
 import LabeledItems
 import Name
-import Syntax
 import Util (File (..))
+
+import Types.Source
+import Types.Primitives
 
 -- canPair is used for the ops (,) (|) (&) which should only appear inside
 -- parentheses (to avoid conflicts with records and other syntax)
 data ParseCtx = ParseCtx { curIndent :: Int
                          , canPair   :: Bool
                          , canBreak  :: Bool }
-type Parser = ReaderT ParseCtx (Parsec Void String)
+type Parser = ReaderT ParseCtx (Parsec Void Text)
 
 -- TODO: implement this more efficiently rather than just parsing the whole
 -- thing and then extracting the deps.
 parseUModuleDeps :: ModuleSourceName -> File -> [ModuleSourceName]
 parseUModuleDeps name file = deps
-  where UModule _ deps _ = parseUModule name $ toString $ fContents file
+  where UModule _ deps _ = parseUModule name $ T.decodeUtf8 $ fContents file
+{-# SCC parseUModuleDeps #-}
 
 finishUModuleParse :: UModulePartialParse -> UModule
 finishUModuleParse (UModulePartialParse name _ file) =
-  parseUModule name (toString $ fContents file)
+  parseUModule name (T.decodeUtf8 $ fContents file)
 
-parseUModule :: ModuleSourceName -> String -> UModule
+parseUModule :: ModuleSourceName -> Text -> UModule
 parseUModule name s = do
   let blocks = mustParseit s $ manyTill (sourceBlock <* outputLines) eof
   let blocks' = if name == Prelude
@@ -58,25 +70,24 @@ parseUModule name s = do
                   ImportModule moduleName -> [moduleName]
                   _ -> []
   UModule name imports blocks'
+{-# SCC parseUModule #-}
 
 preludeImportBlock :: SourceBlock
 preludeImportBlock = SourceBlock 0 0 LogNothing "" $ ImportModule Prelude
 
-parseData :: String -> Except (UExpr VoidS)
-parseData s = parseit s $ expr <* (optional eol >> eof)
-
-parseTopDeclRepl :: String -> Maybe SourceBlock
+parseTopDeclRepl :: Text -> Maybe SourceBlock
 parseTopDeclRepl s = case sbContents b of
   UnParseable True _ -> Nothing
   _ -> Just b
   where b = mustParseit s sourceBlock
+{-# SCC parseTopDeclRepl #-}
 
-parseit :: String -> Parser a -> Except a
+parseit :: Text -> Parser a -> Except a
 parseit s p = case parse (runReaderT p (ParseCtx 0 False False)) "" s of
   Left e  -> throw ParseErr $ errorBundlePretty e
   Right x -> return x
 
-mustParseit :: String -> Parser a -> a
+mustParseit :: Text -> Parser a -> a
 mustParseit s p  = case parseit s p of
   Success x -> x
   Failure e -> error $ "This shouldn't happen:\n" ++ pprint e
@@ -84,7 +95,7 @@ mustParseit s p  = case parseit s p of
 importModule :: Parser SourceBlock'
 importModule = ImportModule . OrdinaryModule <$> do
   keyWord ImportKW
-  s <- lowerName <|> upperName
+  s <- anyCaseName
   eol
   return s
 
@@ -97,6 +108,12 @@ declareForeign = do
   eol
   return $ DeclareForeign foreignName $ UAnnBinder (fromString b) ty
 
+declareCustomLinearization :: Parser SourceBlock'
+declareCustomLinearization = do
+  zeros <- (keyWord CustomLinearizationSymbolicKW $> SymbolicZeros)
+       <|> (keyWord CustomLinearizationKW $> InstantiateZeros)
+  (DeclareCustomLinearization <$> anyCaseName <*> pure zeros <*> expr) <* eol
+
 sourceBlock :: Parser SourceBlock
 sourceBlock = do
   offset <- getOffset
@@ -107,7 +124,7 @@ sourceBlock = do
     return (level, b)
   return $ SourceBlock (unPos (sourceLine pos)) offset level src b
 
-recover :: ParseError String Void -> Parser (LogLevel, SourceBlock')
+recover :: ParseError Text Void -> Parser (LogLevel, SourceBlock')
 recover e = do
   pos <- liftM statePosState getParserState
   reachedEOF <-  try (mayBreak sc >> eof >> return True)
@@ -144,8 +161,8 @@ logBench = do
 passName :: Parser PassName
 passName = choice [thisNameString s $> x | (s, x) <- passNames]
 
-passNames :: [(String, PassName)]
-passNames = [(show x, x) | x <- [minBound..maxBound]]
+passNames :: [(Text, PassName)]
+passNames = [(T.pack $ show x, x) | x <- [minBound..maxBound]]
 
 sourceBlock' :: Parser SourceBlock'
 sourceBlock' =
@@ -155,7 +172,9 @@ sourceBlock' =
   <|> liftM EvalUDecl (instanceDef True  <* eolf)
   <|> liftM EvalUDecl (instanceDef False <* eolf)
   <|> liftM EvalUDecl (interfaceDef <* eolf)
-  <|> liftM (Command (EvalExpr Printed)) (expr <* eol)
+  <|> liftM EvalUDecl (effectDef <* eolf)
+  <|> liftM EvalUDecl (handlerDef <* eolf)
+  <|> liftM (Command (EvalExpr Printed)) (expr <* eolf)
   <|> hidden (some eol >> return EmptyLines)
   <|> hidden (sc >> eol >> return CommentLine)
 
@@ -166,6 +185,7 @@ topLevelCommand :: Parser SourceBlock'
 topLevelCommand =
       importModule
   <|> declareForeign
+  <|> declareCustomLinearization
   <|> (QueryEnv <$> envQuery)
   <|> explicitCommand
   <?> "top-level command"
@@ -178,7 +198,7 @@ envQuery = string ":debug" >> sc >> (
        <* eol
   where
     rawName :: Parser RawName
-    rawName = RawName <$> (fromString <$> anyName) <*> intLit
+    rawName = undefined -- RawName <$> (fromString <$> anyName) <*> intLit
 
 explicitCommand :: Parser SourceBlock'
 explicitCommand = do
@@ -201,25 +221,30 @@ expr = mayNotPair $ makeExprParser leafExpr ops
 
 -- expression without exposed infix operators
 leafExpr :: Parser (UExpr VoidS)
-leafExpr = parens (mayPair $ makeExprParser leafExpr ops)
-         <|> uTabCon
-         <|> uVarOcc
-         <|> uHole
-         <|> uString
-         <|> uLit
-         <|> uPiType
-         <|> uLamExpr
-         <|> uViewExpr
-         <|> uForExpr
-         <|> caseExpr
-         <|> ifExpr
-         <|> uPrim
-         <|> unitCon
-         <|> (uLabeledExprs `fallBackTo` uVariantExpr)
-         <|> uLabel
-         <|> uIsoSugar
-         <|> uDoSugar
-         <?> "expression"
+leafExpr = uVarOcc <|> lookaheadExprs <?> "expression"
+  where
+    lookaheadExprs = do
+      next <- nextChar
+      case next of
+        '_'  -> uHole
+        '('  -> unitCon <|> parens (mayPair $ makeExprParser leafExpr ops)
+        '['  -> uTabCon
+        '\"' -> uString
+        '\'' -> withSrc $ charExpr <$> charLit
+        '\\' -> uLamExpr
+        '%'  -> uPrim
+        '#'  -> uLabel <|> uIsoSugar
+        '{'  -> (uLabeledExprs `fallBackTo` uVariantExpr)
+        _ | isDigit next -> withSrc (    UNatLit   <$> natLit
+                                     <|> UFloatLit <$> doubleLit)
+        -- Here we can't commit to a single option yet
+        'v'  -> uViewExpr <|> uPiType
+        'f'  -> uForExpr  <|> uPiType
+        'r'  -> uForExpr  <|> uPiType  -- uForExpr also supports rof
+        'c'  -> caseExpr  <|> uPiType
+        'i'  -> ifExpr    <|> uPiType
+        'd'  -> uDoSugar  <|> uPiType
+        _    -> uPiType
 
 containedExpr :: Parser (UExpr VoidS)
 containedExpr =   parens (mayPair $ makeExprParser leafExpr ops)
@@ -240,14 +265,7 @@ uString = do
   (s, pos) <- withPos $ strLit
   let addSrc = WithSrcE (Just pos)
   let cs = map (addSrc . charExpr) s
-  return $ mkApp (addSrc "toList") $ addSrc $ UTabCon cs
-
-uLit :: Parser (UExpr VoidS)
-uLit = withSrc $ uLitParser
-  where uLitParser = charExpr <$> charLit
-                 <|> UIntLit  <$> intLit
-                 <|> UFloatLit <$> doubleLit
-                 <?> "literal"
+  return $ mkApp (addSrc "to_list") $ addSrc $ UTabCon cs
 
 charExpr :: Char -> (UExpr' VoidS)
 charExpr c = UPrimExpr $ ConExpr $ Lit $ Word8Lit $ fromIntegral $ fromEnum c
@@ -259,8 +277,7 @@ uHole :: Parser (UExpr VoidS)
 uHole = withSrc $ underscore $> UHole
 
 letAnnStr :: Parser LetAnn
-letAnnStr =   (string "instance"   $> InstanceLet)
-          <|> (string "noinline"   $> NoInlineLet)
+letAnnStr = (string "noinline"   $> NoInlineLet)
 
 topDecl :: Parser (UDecl VoidS VoidS)
 topDecl = dataDef <|> topLet
@@ -289,6 +306,27 @@ interfaceDef = do
   let tyConParams' = tyConParams
   return $ UInterface tyConParams' superclasses methodTys
                       (fromString tyConName) methodNames'
+
+resumePolicy :: Parser UResumePolicy
+resumePolicy =  (keyWord JmpKW $> UNoResume)
+            <|> (keyWord DefKW $> ULinearResume)
+            <|> (keyWord CtlKW $> UAnyResume)
+
+opSigList :: Parser (Nest (UBinder EffectOpNameC) VoidS VoidS, [UEffectOpType VoidS])
+opSigList = do
+  (methodNames, methodTys) <- unzip <$> onePerLine do
+    policy <- resumePolicy
+    v <- anyName
+    ty <- annot uType
+    return (fromString v, UEffectOpType policy ty)
+  return (toNest methodNames, methodTys)
+
+effectDef :: Parser (UDecl VoidS VoidS)
+effectDef = do
+  keyWord EffectKW
+  effName <- anyName
+  (methodNames, methodTys) <- opSigList
+  return $ UEffectDecl methodTys (fromString effName) methodNames
 
 toNest :: (IsString (a VoidS VoidS)) => [String] -> Nest a VoidS VoidS
 toNest = toNestParsed . map fromString
@@ -336,7 +374,7 @@ dataConDefBinder = annBinder <|> (UAnnBinder UIgnore <$> containedExpr)
 
 decl :: Parser (UDecl VoidS VoidS)
 decl = do
-  lhs <- simpleLet <|> funDefLet
+  lhs <- funDefLet <|> (try $ simpleLet <* lookAhead (sym "="))
   rhs <- sym "=" >> blockOrExpr
   return $ lhs rhs
 
@@ -359,12 +397,32 @@ instanceMethod = do
   rhs <- blockOrExpr
   return $ UMethodDef (fromString v) rhs
 
+handlerDef :: Parser (UDecl VoidS VoidS)
+handlerDef = do
+  keyWord HandlerKW
+  handlerName <- anyName
+  keyWord OfKW
+  effectName <- anyName
+  binders <- concat <$> many (
+    argInParens [parensExplicitArg, parensImplicitArg, parensIfaceArg])
+  (eff, ty) <- label "result type annotation" $ annot effectiveType
+  methods <- onePerLine effectOpDef
+  return $ UHandlerDecl (fromString effectName) (toNestParsed binders)
+    eff ty methods (fromString handlerName)
+
+effectOpDef :: Parser (UEffectOpDef VoidS)
+effectOpDef = do
+  (rp, v) <- (keyWord ReturnKW $> (UReturn, "return"))
+         <|> ((,) <$> resumePolicy <*> anyName)
+  sym "="
+  rhs <- blockOrExpr
+  return $ UEffectOpDef (fromString v) rp rhs
+
 simpleLet :: Parser (UExpr VoidS -> UDecl VoidS VoidS)
 simpleLet = label "let binding" $ do
-  letAnn <- (InstanceLet <$ string "%instance" <* sc) <|> (pure PlainLet)
   p <- try $ (letPat <|> leafPat) <* lookAhead (sym "=" <|> sym ":")
   typeAnn <- optional $ annot uType
-  return $ ULet letAnn (UPatAnn p typeAnn)
+  return $ ULet PlainLet (UPatAnn p typeAnn)
 
 letPat :: Parser (UPat VoidS VoidS)
 letPat = withSrcB $ fromString <$> anyName
@@ -468,6 +526,14 @@ buildLam binders body@(WithSrcE pos _) = case binders of
      where UPatAnn (WithSrcB pos' _) _ = b
            lam = ULamExpr arr b $ buildLam bs body
 
+buildTabLam :: [UPatAnn VoidS VoidS] -> UExpr VoidS -> UExpr VoidS
+buildTabLam binders body@(WithSrcE pos _) = case binders of
+  [] -> body
+  -- TODO: join with source position of binders too
+  b:bs -> WithSrcE (joinPos pos' pos) $ UTabLam lam
+   where UPatAnn (WithSrcB pos' _) _ = b
+         lam = UTabLamExpr b $ buildTabLam bs body
+
 -- TODO Does this generalize?  Swap list for Nest?
 buildFor :: SrcPos -> Direction -> [UPatAnn VoidS VoidS] -> UExpr VoidS -> UExpr VoidS
 buildFor pos dir binders body = case binders of
@@ -480,7 +546,7 @@ uViewExpr = do
   bs <- some patAnn
   argTerm
   body <- blockOrExpr
-  return $ buildLam (zipWith UPatAnnArrow bs (repeat TabArrow)) body
+  return $ buildTabLam bs body
 
 uForExpr :: Parser (UExpr VoidS)
 uForExpr = do
@@ -540,9 +606,13 @@ uStatement = withPos $   liftM LeftB  (instanceDef True <|> decl)
 
 -- TODO: put the `try` only around the `x:` not the annotation itself
 uPiType :: Parser (UExpr VoidS)
-uPiType = withSrc $ upi <$> piBinderPat <*> arrow effects <*> uType
+uPiType = withSrc do
+  p <- piBinderPat
+  (     (sym "=>" >> (UTabPi <$> UTabPiExpr p <$> uType))
+    <|> (upi p <$> arrow <*> uType))
   where
     upi binder (arr, eff) ty = UPi $ UPiExpr arr binder (fromMaybe Pure eff) ty
+
     piBinderPat :: Parser (UPatAnn VoidS VoidS)
     piBinderPat = do
       UAnnBinder b ty@(WithSrcE pos _) <- annBinder
@@ -565,13 +635,12 @@ anonBinder =
   label "anonymous annoted binder" $ UAnnBinder UIgnore <$>
     (underscore >> sym ":" >> containedExpr)
 
-arrow :: Parser eff -> Parser (Arrow, Maybe eff)
-arrow p =   (sym "->"  >> liftM ((PlainArrow,) . Just) p)
-        <|> (sym "=>"  $> (TabArrow, Nothing))
-        <|> (sym "--o" $> (LinArrow, Nothing))
-        <|> (sym "?->" $> (ImplicitArrow, Nothing))
-        <|> (sym "?=>" $> (ClassArrow, Nothing))
-        <?> "arrow"
+arrow :: Parser (Arrow, Maybe (UEffectRow VoidS))
+arrow =   (sym "->"  >> liftM ((PlainArrow,) . Just) effects)
+      <|> (sym "--o" $> (LinArrow, Nothing))
+      <|> (sym "?->" $> (ImplicitArrow, Nothing))
+      <|> (sym "?=>" $> (ClassArrow, Nothing))
+      <?> "arrow"
 
 caseExpr :: Parser (UExpr VoidS)
 caseExpr = withSrc $ do
@@ -614,6 +683,7 @@ blockThenElse = withIndent $ mayNotBreak $ do
 onePerLine :: Parser a -> Parser [a]
 onePerLine p =   liftM (:[]) p
              <|> (withIndent $ mayNotBreak $ p `sepBy1` try nextLine)
+{-# INLINE onePerLine #-}
 
 uBinder :: Parser (UBinder AtomNameC VoidS VoidS)
 uBinder = (fromString <$> lowerName) <|> (underscore $> UIgnore)
@@ -622,15 +692,12 @@ pat :: Parser (UPat VoidS VoidS)
 pat = mayNotPair $ makeExprParser leafPat patOps
 
 leafPat :: Parser (UPat VoidS VoidS)
-leafPat =
-      (withSrcB (symbol "()" $> (UPatUnit UnitB)))
-  <|> parens (mayPair $ makeExprParser leafPat patOps)
-  <|> (withSrcB $
-          (UPatBinder <$> uBinder)
-      <|> (UPatCon    <$> (fromString <$> upperName) <*> manyNested pat)
-      <|> (variantPat `fallBackTo` recordPat)
-      <|> brackets (UPatTable <$> toNestParsed <$> leafPat `sepBy` sym ",")
-  )
+leafPat = nextChar >>= \case
+  '(' -> (withSrcB (symbol "()" $> (UPatUnit UnitB))) <|> parens (mayPair $ makeExprParser leafPat patOps)
+  '{' -> withSrcB $ variantPat `fallBackTo` recordPat
+  '[' -> withSrcB $ brackets $ UPatTable <$> toNestParsed <$> leafPat `sepBy` sym ","
+  _ -> withSrcB $ (UPatBinder <$> uBinder)
+              <|> (UPatCon    <$> (fromString <$> upperName) <*> manyNested pat)
   where pun pos l = WithSrcB (Just pos) $ fromString l
         variantPat = parseVariant leafPat UPatVariant UPatVariantLift
         recordPat = (UPatRecord UEmptyRowPat <$ braces (return ())) `fallBackTo`
@@ -649,6 +716,7 @@ patPairOp = do
 
 annot :: Parser a -> Parser a
 annot p = label "type annotation" $ sym ":" >> p
+{-# INLINE annot #-}
 
 patAnn :: Parser (UPatAnn VoidS VoidS)
 patAnn = label "pattern" $ UPatAnn <$> pat <*> optional (annot containedExpr)
@@ -712,7 +780,7 @@ uIsoSugar = withSrc (char '#' *> options) where
   alt = UAlt
   recordFieldIso :: Label -> UExpr' VoidS
   recordFieldIso field =
-    UApp plain (ns "MkIso") $
+    UApp (ns "MkIso") $
       ns $ URecord
         [ UStaticField "fwd" (lam
             (uPatRecordLit [(field, "x")] (Just "r"))
@@ -723,7 +791,7 @@ uIsoSugar = withSrc (char '#' *> options) where
         ]
   variantFieldIso :: Label -> UExpr' VoidS
   variantFieldIso field =
-    UApp plain "MkIso" $
+    UApp "MkIso" $
       ns $ URecord
         [ UStaticField "fwd" (lam "v" $ ns $ UCase "v"
             [ alt (nsB $ UPatVariant NoLabeledItems field "x")
@@ -739,7 +807,7 @@ uIsoSugar = withSrc (char '#' *> options) where
             ])
         ]
   recordZipIso field =
-    UApp plain "MkIso" $
+    UApp "MkIso" $
       ns $ URecord
         [ UStaticField "fwd" (lam
           (nsB $ UPatPair $ PairB
@@ -758,7 +826,7 @@ uIsoSugar = withSrc (char '#' *> options) where
         ]
   variantZipIso :: Label -> UExpr' VoidS
   variantZipIso field =
-    UApp plain "MkIso" $
+    UApp "MkIso" $
       ns $ URecord
         [ UStaticField "fwd" (lam "v" $ ns $ UCase "v"
             [ alt (nsB $ UPatCon "Left" (toNest ["l"]))
@@ -799,7 +867,7 @@ uPatRecordLit labelsPats ext = nsB $ UPatRecord $ foldr addLabel extPat labelsPa
     addLabel (l, p) rest = UStaticFieldPat l p rest
 
 parseFieldRowElems
-  :: String -> String
+  :: Text -> Text
   -> Parser (UExpr VoidS) -> Maybe (SrcPos -> Label -> UExpr VoidS)
   -> Parser (UFieldRowElems VoidS)
 parseFieldRowElems sep bindwith itemparser punner =
@@ -833,7 +901,7 @@ parseFieldRowElems sep bindwith itemparser punner =
       return $ UStaticField l rhs
 
 parseFieldRowPat
-  :: String -> String
+  :: Text -> Text
   -> Maybe (SrcPos -> Label -> UPat VoidS VoidS)
   -> Parser (UFieldRowPat VoidS VoidS)
 parseFieldRowPat sep bindwith punner =
@@ -877,7 +945,7 @@ parseFieldRowPat sep bindwith punner =
       return $ UStaticFieldPat l rhs
 
 parseLabeledItems
-  :: String -> String -> Parser b -> Parser a
+  :: Text -> Text -> Parser b -> Parser a
   -> Maybe (SrcPos -> Label -> a) -> Maybe (SrcPos -> a)
   -> Parser (Maybe b, ExtLabeledItems a a)
 parseLabeledItems sep bindwith prefixparser itemparser punner tailDefault =
@@ -944,12 +1012,12 @@ fallBackTo optionA optionB = do
 -- literal symbols here must only use chars from `symChars`
 ops :: [[Operator Parser (UExpr VoidS)]]
 ops =
-  [ [InfixL $ sym "." $> mkGenApp TabArrow, symOp "!"]
-  , [InfixL $ sc $> mkApp]
-  , [prefixNegOp]
+  [ [InfixL $ sym "." $> mkTabApp , symOp "!"]
+  , [InfixL $ sc $> mkApp, resumeOp]
+  , [prefixNegOp, prefixPosOp]
   , [anySymOp] -- other ops with default fixity
   , [symOp "+", symOp "-", symOp "||", symOp "&&",
-     InfixR $ sym "=>" $> mkArrow TabArrow Pure,
+     InfixR $ sym "=>" $> mkTabType,
      InfixL $ opWithSrc $ backquoteName >>= (return . binApp),
      symOp "<<<", symOp ">>>", symOp "<<&", symOp "&>>"]
   , [annotatedExpr]
@@ -964,6 +1032,7 @@ opWithSrc :: Parser (SrcPos -> a -> a -> a)
 opWithSrc p = do
   (f, pos) <- withPos p
   return $ f pos
+{-# INLINE opWithSrc #-}
 
 anySymOp :: Operator Parser (UExpr VoidS)
 anySymOp = InfixL $ opWithSrc $ do
@@ -971,7 +1040,7 @@ anySymOp = InfixL $ opWithSrc $ do
   return $ binApp s
 
 infixSym :: SourceName -> Parser ()
-infixSym s = mayBreak $ sym s
+infixSym s = mayBreak $ sym $ T.pack s
 
 symOp :: SourceName -> Operator Parser (UExpr VoidS)
 symOp s = InfixL $ symOpP s
@@ -988,36 +1057,57 @@ pairingSymOpP s = opWithSrc $ do
     then infixSym s >> return (binApp (fromString $ "("<>s<>")"))
     else fail $ "Unexpected delimiter " <> s
 
+resumeOp :: Operator Parser (UExpr VoidS)
+resumeOp = Prefix $ label "resume" $ do
+  ((), pos) <- withPos $ keyWord ResumeKW
+  return \(WithSrcE litpos e) -> do
+    let pos' = joinPos (Just pos) litpos
+    let ty = WithSrcE (Just pos) UHole
+    let arg = WithSrcE litpos e
+    WithSrcE pos' $ UPrimExpr $ OpExpr $ Resume ty arg
+
 prefixNegOp :: Operator Parser (UExpr VoidS)
 prefixNegOp = Prefix $ label "negation" $ do
   ((), pos) <- withPos $ sym "-"
-  let f = WithSrcE (Just pos) "neg"
-  return \case
-    -- Special case: negate literals directly
-    WithSrcE litpos (IntLitExpr i)
-      -> WithSrcE (joinPos (Just pos) litpos) (IntLitExpr (-i))
-    WithSrcE litpos (FloatLitExpr i)
-      -> WithSrcE (joinPos (Just pos) litpos) (FloatLitExpr (-i))
-    x -> mkApp f x
+  return \(WithSrcE litpos e) -> do
+    let pos' = joinPos (Just pos) litpos
+    case e of
+      UNatLit   i -> WithSrcE pos' $ UIntLit   (-(fromIntegral i))
+      UIntLit   i -> WithSrcE pos' $ UIntLit   (-i)
+      UFloatLit i -> WithSrcE pos' $ UFloatLit (-i)
+      _ -> do
+        let f = WithSrcE (Just pos) "neg"
+        mkApp f $ WithSrcE litpos e
+
+prefixPosOp :: Operator Parser (UExpr VoidS)
+prefixPosOp = Prefix $ label "positive" $ do
+  ((), pos) <- withPos $ sym "+"
+  return \(WithSrcE litpos e) -> do
+    let pos' = joinPos (Just pos) litpos
+    WithSrcE pos' case e of
+      UNatLit   i -> UIntLit   (fromIntegral i)
+      UIntLit   i -> UIntLit   i
+      UFloatLit i -> UFloatLit i
+      _ -> e
 
 binApp :: SourceName -> SrcPos -> UExpr VoidS -> UExpr VoidS -> UExpr VoidS
 binApp f pos x y = (f' `mkApp` x) `mkApp` y
   where f' = WithSrcE (Just pos) $ fromString f
 
-mkGenApp :: Arrow -> UExpr (n::S) -> UExpr n -> UExpr n
-mkGenApp arr f x = joinSrc f x $ UApp arr f x
-
 mkApp :: UExpr (n::S) -> UExpr n -> UExpr n
-mkApp = mkGenApp PlainArrow
+mkApp f x = joinSrc f x $ UApp f x
+
+mkTabApp :: UExpr (n::S) -> UExpr n -> UExpr n
+mkTabApp f x = joinSrc f x $ UTabApp f x
 
 infixArrow :: Parser (UType VoidS -> UType VoidS -> UType VoidS)
 infixArrow = do
   notFollowedBy (sym "=>")  -- table arrows have special fixity
-  ((arr, eff), pos) <- withPos $ arrow effects
+  ((arr, eff), pos) <- withPos arrow
   return \a b -> WithSrcE (Just pos) $ UPi $ UPiExpr arr (UPatAnn (nsB UPatIgnore) (Just a)) (fromMaybe Pure eff) b
 
-mkArrow :: Arrow -> UEffectRow VoidS -> UExpr VoidS -> UExpr VoidS -> UExpr VoidS
-mkArrow arr eff a b = joinSrc a b $ UPi $ UPiExpr arr (UPatAnn (nsB UPatIgnore) (Just a)) eff b
+mkTabType :: UExpr VoidS -> UExpr VoidS -> UExpr VoidS
+mkTabType a b = joinSrc a b $ UTabPi $ UTabPiExpr (UPatAnn (nsB UPatIgnore) (Just a)) b
 
 withSrc :: Parser (a n) -> Parser (WithSrcE a n)
 withSrc p = do
@@ -1042,33 +1132,19 @@ joinPos (Just (l, h)) (Just (l', h')) = Just (min l l', max h h')
 
 indexRangeOps :: [Operator Parser (UExpr VoidS)]
 indexRangeOps =
-  [ Prefix    $ symPos ".."   <&> \pos h   -> range pos  Unlimited       (InclusiveLim h)
-  , inpostfix $ symPos ".."   <&> \pos l h -> range pos (InclusiveLim l) (limFromMaybe h)
-  , inpostfix $ symPos "<.."  <&> \pos l h -> range pos (ExclusiveLim l) (limFromMaybe h)
-  , Prefix    $ symPos "..<"  <&> \pos h   -> range pos  Unlimited       (ExclusiveLim h)
-  , InfixL    $ symPos "..<"  <&> \pos l h -> range pos (InclusiveLim l) (ExclusiveLim h)
-  , InfixL    $ symPos "<..<" <&> \pos l h -> range pos (ExclusiveLim l) (ExclusiveLim h) ]
+  [ Prefix  $ symPos ".."  <&> \pos l -> range "RangeTo"      pos l
+  , Prefix  $ symPos "..<" <&> \pos l -> range "RangeToExc"   pos l
+  , Postfix $ symPos ".."  <&> \pos l -> range "RangeFrom"    pos l
+  , Postfix $ symPos "<.." <&> \pos l -> range "RangeFromExc" pos l ]
   where
-    range pos l h = WithSrcE (Just pos) $ UIndexRange l h
     symPos s = snd <$> withPos (sym s)
 
-limFromMaybe :: Maybe a -> Limit a
-limFromMaybe Nothing = Unlimited
-limFromMaybe (Just x) = InclusiveLim x
+    range :: SourceName -> SrcPos -> UExpr VoidS -> UExpr VoidS
+    range rangeName pos lim = binApp rangeName pos (ns UHole) lim
 
 annotatedExpr :: Operator Parser (UExpr VoidS)
 annotatedExpr = InfixL $ opWithSrc $
-  sym ":" $> (\pos v ty -> WithSrcE (Just pos) $ UTypeAnn v ty)
-
-inpostfix :: Parser (UExpr VoidS -> Maybe (UExpr VoidS) -> UExpr VoidS)
-          -> Operator Parser (UExpr VoidS)
-inpostfix = inpostfix' expr
-
-inpostfix' :: Parser a -> Parser (a -> Maybe a -> a) -> Operator Parser a
-inpostfix' p op = Postfix $ do
-  f <- op
-  rest <- optional p
-  return \x -> f x rest
+  sym "::" $> (\pos v ty -> WithSrcE (Just pos) $ UTypeAnn v ty)
 
 -- === lexemes ===
 
@@ -1079,6 +1155,15 @@ data KeyWord = DefKW | ForKW | For_KW | RofKW | Rof_KW | CaseKW | OfKW
              | ReadKW | WriteKW | StateKW | DataKW | InterfaceKW
              | InstanceKW | WhereKW | IfKW | ThenKW | ElseKW | DoKW
              | ExceptKW | IOKW | ViewKW | ImportKW | ForeignKW | NamedInstanceKW
+             | EffectKW | HandlerKW | JmpKW | CtlKW | ReturnKW | ResumeKW
+             | CustomLinearizationKW | CustomLinearizationSymbolicKW
+
+nextChar :: Lexer Char
+nextChar = do
+  i <- getInput
+  guard $ not $ T.null i
+  return $ T.head i
+{-# INLINE nextChar #-}
 
 upperName :: Lexer SourceName
 upperName = label "upper-case name" $ lexeme $
@@ -1089,16 +1174,19 @@ lowerName = label "lower-case name" $ lexeme $
   checkNotKeyword $ (:) <$> lowerChar <*> many nameTailChar
 
 anyCaseName  :: Lexer SourceName
-anyCaseName = lowerName <|> upperName
+anyCaseName = label "name" $ lexeme $
+  checkNotKeyword $ (:) <$> satisfy (\c -> isLower c || isUpper c) <*>
+    (T.unpack <$> takeWhileP Nothing (\c -> isAlphaNum c || c == '\'' || c == '_'))
 
-anyName  :: Lexer SourceName
-anyName = lowerName <|> upperName <|> symName
+anyName :: Lexer SourceName
+anyName = anyCaseName <|> symName
 
 checkNotKeyword :: Parser String -> Parser String
 checkNotKeyword p = try $ do
   s <- p
-  failIf (s `elem` keyWordStrs) $ show s ++ " is a reserved word"
+  failIf (s `HS.member` keyWordSet) $ show s ++ " is a reserved word"
   return s
+{-# INLINE checkNotKeyword #-}
 
 keyWord :: KeyWord -> Lexer ()
 keyWord kw = lexeme $ try $ string s >> notFollowedBy nameTailChar
@@ -1128,12 +1216,25 @@ keyWord kw = lexeme $ try $ string s >> notFollowedBy nameTailChar
       ViewKW -> "view"
       ImportKW -> "import"
       ForeignKW -> "foreign"
+      EffectKW -> "effect"
+      HandlerKW -> "handler"
+      JmpKW -> "jmp"
+      CtlKW -> "ctl"
+      ReturnKW -> "return"
+      ResumeKW -> "resume"
+      CustomLinearizationKW -> "custom-linearization"
+      CustomLinearizationSymbolicKW -> "custom-linearization-symbolic"
+
+keyWordSet :: HS.HashSet String
+keyWordSet = HS.fromList keyWordStrs
 
 keyWordStrs :: [String]
 keyWordStrs = ["def", "for", "for_", "rof", "rof_", "case", "of", "llam",
                "Read", "Write", "Accum", "Except", "IO", "data", "interface",
                "instance", "named-instance", "where", "if", "then", "else",
-               "do", "view", "import", "foreign"]
+               "do", "view", "import", "foreign", "effect", "jmp", "ctl",
+               "return", "resume", "custom-linearization",
+               "custom-linearization-symbolic"]
 
 fieldLabel :: Lexer Label
 fieldLabel = label "field label" $ lexeme $
@@ -1148,28 +1249,33 @@ charLit = lexeme $ char '\'' >> L.charLiteral <* char '\''
 strLit :: Lexer String
 strLit = lexeme $ char '"' >> manyTill L.charLiteral (char '"')
 
-intLit :: Lexer Int
-intLit = lexeme $ try $ L.decimal <* notFollowedBy (char '.')
+natLit :: Lexer Word64
+natLit = lexeme $ try $ L.decimal <* notFollowedBy (char '.')
 
 doubleLit :: Lexer Double
 doubleLit = lexeme $
       try L.float
   <|> try (fromIntegral <$> (L.decimal :: Parser Int) <* char '.')
+  <|> try do
+    s <- L.scientific
+    case Scientific.toBoundedRealFloat s of
+      Right f -> return f
+      Left  _ -> fail "Non-representable floating point literal"
 
-knownSymStrs :: [String]
-knownSymStrs = [".", ":", "!", "=", "-", "+", "||", "&&", "$", "&", "|", ",", "+=", ":=",
-                "->", "=>", "?->", "?=>", "--o", "--", "<<<", ">>>", "<<&", "&>>",
-                "..", "<..", "..<", "..<", "<..<", "?"]
+knownSymStrs :: HS.HashSet String
+knownSymStrs = HS.fromList
+  [".", ":", "::", "!", "=", "-", "+", "||", "&&", "$", "&", "|", ",", "+=", ":="
+  , "->", "=>", "?->", "?=>", "--o", "--", "<<<", ">>>", "<<&", "&>>"
+  , "..", "<..", "..<", "..<", "<..<", "?"]
 
 -- string must be in `knownSymStrs`
-sym :: String -> Lexer ()
+sym :: Text -> Lexer ()
 sym s = lexeme $ try $ string s >> notFollowedBy symChar
 
 anySym :: Lexer String
 anySym = lexeme $ try $ do
   s <- some symChar
-  -- TODO: consider something faster than linear search here
-  failIf (s `elem` knownSymStrs) ""
+  failIf (s `HS.member` knownSymStrs) ""
   return $ "(" <> s <> ")"
 
 symName :: Lexer SourceName
@@ -1179,13 +1285,13 @@ symName = label "symbol name" $ lexeme $ try $ do
 
 backquoteName :: Lexer SourceName
 backquoteName = label "backquoted name" $
-  lexeme $ try $ between (char '`') (char '`') (upperName <|> lowerName)
+  lexeme $ try $ between (char '`') (char '`') anyCaseName
 
 -- brackets and punctuation
 -- (can't treat as sym because e.g. `((` is two separate lexemes)
 lParen, rParen, lBracket, rBracket, lBrace, rBrace, semicolon, underscore :: Lexer ()
 
-lParen    = notFollowedBy symName >> notFollowedBy unitCon >> charLexeme '('
+lParen    = charLexeme '('
 rParen    = charLexeme ')'
 lBracket  = charLexeme '['
 rBracket  = charLexeme ']'
@@ -1201,23 +1307,20 @@ nameTailChar :: Parser Char
 nameTailChar = alphaNumChar <|> char '\'' <|> char '_'
 
 symChar :: Parser Char
-symChar = choice $ map char symChars
+symChar = token (\c -> if HS.member c symChars then Just c else Nothing) mempty
 
-symChars :: [Char]
-symChars = ".,!$^&*:-~+/=<>|?\\@"
+symChars :: HS.HashSet Char
+symChars = HS.fromList ".,!$^&*:-~+/=<>|?\\@"
 
 -- === Util ===
 
 sc :: Parser ()
-sc = L.space space lineComment empty
+sc = skipMany $ hidden space <|> hidden lineComment
 
 lineComment :: Parser ()
 lineComment = do
   try $ string "--" >> notFollowedBy (void (char 'o'))
   void (takeWhileP (Just "char") (/= '\n'))
-
-emptyLines :: Parser ()
-emptyLines = void $ many (sc >> eol)
 
 outputLines :: Parser ()
 outputLines = void $ many (symbol ">" >> takeWhileP Nothing (/= '\n') >> ((eol >> return ()) <|> eof))
@@ -1234,32 +1337,35 @@ space = do
 
 mayBreak :: Parser a -> Parser a
 mayBreak p = local (\ctx -> ctx { canBreak = True }) p
+{-# INLINE mayBreak #-}
 
 mayNotBreak :: Parser a -> Parser a
 mayNotBreak p = local (\ctx -> ctx { canBreak = False }) p
+{-# INLINE mayNotBreak #-}
 
 mayPair :: Parser a -> Parser a
 mayPair p = local (\ctx -> ctx { canPair = True }) p
+{-# INLINE mayPair #-}
 
 mayNotPair :: Parser a -> Parser a
 mayNotPair p = local (\ctx -> ctx { canPair = False }) p
+{-# INLINE mayNotPair #-}
 
 optionalMonoid :: Monoid a => Parser a -> Parser a
 optionalMonoid p = p <|> return mempty
+{-# INLINE optionalMonoid #-}
 
 nameString :: Parser String
 nameString = lexeme . try $ (:) <$> lowerChar <*> many alphaNumChar
 
-thisNameString :: String -> Parser ()
+thisNameString :: Text -> Parser ()
 thisNameString s = lexeme $ try $ string s >> notFollowedBy alphaNumChar
-
-uint :: Parser Int
-uint = L.decimal <* sc
 
 lexeme :: Parser a -> Parser a
 lexeme = L.lexeme sc
+{-# INLINE lexeme #-}
 
-symbol :: String -> Parser ()
+symbol :: Text -> Parser ()
 symbol s = void $ L.symbol sc s
 
 argTerm :: Parser ()
@@ -1267,18 +1373,23 @@ argTerm = mayNotBreak $ sym "."
 
 bracketed :: Parser () -> Parser () -> Parser a -> Parser a
 bracketed left right p = between left right $ mayBreak $ sc >> p
+{-# INLINE bracketed #-}
 
 parens :: Parser a -> Parser a
 parens p = bracketed lParen rParen p
+{-# INLINE parens #-}
 
 brackets :: Parser a -> Parser a
 brackets p = bracketed lBracket rBracket p
+{-# INLINE brackets #-}
 
 braces :: Parser a -> Parser a
 braces p = bracketed lBrace rBrace p
+{-# INLINE braces #-}
 
 manyNested :: Parser (a VoidS VoidS) -> Parser (Nest a VoidS VoidS)
 manyNested p = toNestParsed <$> many p
+{-# INLINE manyNested #-}
 
 withPos :: Parser a -> Parser (a, SrcPos)
 withPos p = do
@@ -1286,6 +1397,7 @@ withPos p = do
   x <- p
   n' <- getOffset
   return $ (x, (n, n'))
+{-# INLINE withPos #-}
 
 nextLine :: Parser ()
 nextLine = do
@@ -1294,17 +1406,19 @@ nextLine = do
   void $ mayNotBreak $ many $ try (sc >> eol)
   void $ replicateM n (char ' ')
 
-withSource :: Parser a -> Parser (String, a)
+withSource :: Parser a -> Parser (Text, a)
 withSource p = do
   s <- getInput
   (x, (start, end)) <- withPos p
-  return (take (end - start) s, x)
+  return (T.take (end - start) s, x)
+{-# INLINE withSource #-}
 
 withIndent :: Parser a -> Parser a
 withIndent p = do
   nextLine
-  indent <- liftM length $ some (char ' ')
+  indent <- T.length <$> takeWhileP (Just "space") (==' ')
   local (\ctx -> ctx { curIndent = curIndent ctx + indent }) $ p
+{-# INLINE withIndent #-}
 
 eol :: Parser ()
 eol = void MC.eol
@@ -1318,3 +1432,103 @@ failIf False _ = return ()
 
 _debug :: Show a => String -> Parser a -> Parser a
 _debug s m = mapReaderT (Text.Megaparsec.Debug.dbg s) m
+
+-- === primitive constructors and operators ===
+
+type PrimName = PrimExpr ()
+
+strToPrimName :: String -> Maybe PrimName
+strToPrimName s = M.lookup s builtinNames
+
+primNameToStr :: PrimName -> String
+primNameToStr prim = case lookup prim $ map swap $ M.toList builtinNames of
+  Just s  -> s
+  Nothing -> show prim
+
+showPrimName :: PrimExpr e -> String
+showPrimName prim = primNameToStr $ fmap (const ()) prim
+{-# NOINLINE showPrimName #-}
+
+-- TODO: Can we derive these generically? Or use Show/Read?
+--       (These prelude-only names don't have to be pretty.)
+builtinNames :: M.Map String PrimName
+builtinNames = M.fromList
+  [ ("iadd", binOp IAdd), ("isub", binOp ISub)
+  , ("imul", binOp IMul), ("fdiv", binOp FDiv)
+  , ("fadd", binOp FAdd), ("fsub", binOp FSub)
+  , ("fmul", binOp FMul), ("idiv", binOp IDiv)
+  , ("irem", binOp IRem)
+  , ("fpow", binOp FPow)
+  , ("and" , binOp BAnd), ("or"  , binOp BOr ), ("not" , unOp BNot), ("xor", binOp BXor)
+  , ("shl" , binOp BShL), ("shr" , binOp BShR)
+  , ("ieq" , binOp (ICmp Equal  )), ("feq", binOp (FCmp Equal  ))
+  , ("igt" , binOp (ICmp Greater)), ("fgt", binOp (FCmp Greater))
+  , ("ilt" , binOp (ICmp Less)),    ("flt", binOp (FCmp Less))
+  , ("fneg", unOp  FNeg)
+  , ("exp" , unOp  Exp), ("exp2"  , unOp  Exp2)
+  , ("log" , unOp Log), ("log2" , unOp Log2 ), ("log10" , unOp Log10)
+  , ("sin" , unOp  Sin), ("cos" , unOp Cos)
+  , ("tan" , unOp  Tan), ("sqrt", unOp Sqrt)
+  , ("floor", unOp Floor), ("ceil", unOp Ceil), ("round", unOp Round)
+  , ("log1p", unOp Log1p), ("lgamma", unOp LGamma)
+  , ("sumToVariant"   , OpExpr $ SumToVariant ())
+  , ("throwError"     , OpExpr $ ThrowError ())
+  , ("throwException" , OpExpr $ ThrowException ())
+  , ("ask"        , OpExpr $ PrimEffect () $ MAsk)
+  , ("mextend"    , OpExpr $ PrimEffect () $ MExtend (BaseMonoid () ()) ())
+  , ("get"        , OpExpr $ PrimEffect () $ MGet)
+  , ("put"        , OpExpr $ PrimEffect () $ MPut  ())
+  , ("indexRef"   , OpExpr $ IndexRef () ())
+  , ("select"     , OpExpr $ Select () () ())
+  , ("while"           , HofExpr $ While ())
+  , ("linearize"       , HofExpr $ Linearize ())
+  , ("linearTranspose" , HofExpr $ Transpose ())
+  , ("runReader"       , HofExpr $ RunReader () ())
+  , ("runWriter"       , HofExpr $ RunWriter (BaseMonoid () ()) ())
+  , ("runState"        , HofExpr $ RunState  () ())
+  , ("runIO"           , HofExpr $ RunIO ())
+  , ("catchException"  , HofExpr $ CatchException ())
+  , ("TyKind"    , TCExpr $ TypeKind)
+  , ("Float64"   , TCExpr $ BaseType $ Scalar Float64Type)
+  , ("Float32"   , TCExpr $ BaseType $ Scalar Float32Type)
+  , ("Int64"     , TCExpr $ BaseType $ Scalar Int64Type)
+  , ("Int32"     , TCExpr $ BaseType $ Scalar Int32Type)
+  , ("Word8"     , TCExpr $ BaseType $ Scalar Word8Type)
+  , ("Word32"    , TCExpr $ BaseType $ Scalar Word32Type)
+  , ("Word64"    , TCExpr $ BaseType $ Scalar Word64Type)
+  , ("Int32Ptr"  , TCExpr $ BaseType $ ptrTy $ Scalar Int32Type)
+  , ("Word8Ptr"  , TCExpr $ BaseType $ ptrTy $ Scalar Word8Type)
+  , ("Word32Ptr" , TCExpr $ BaseType $ ptrTy $ Scalar Word32Type)
+  , ("Word64Ptr" , TCExpr $ BaseType $ ptrTy $ Scalar Word64Type)
+  , ("Float32Ptr", TCExpr $ BaseType $ ptrTy $ Scalar Float32Type)
+  , ("PtrPtr"    , TCExpr $ BaseType $ ptrTy $ ptrTy $ Scalar Word8Type)
+  , ("Fin"       , TCExpr $ Fin ())
+  , ("Label"     , TCExpr $ LabelType)
+  , ("Ref"       , TCExpr $ RefType (Just ()) ())
+  , ("PairType"  , TCExpr $ ProdType [(), ()])
+  , ("UnitType"  , TCExpr $ ProdType [])
+  , ("EffKind"   , TCExpr $ EffectRowKind)
+  , ("LabeledRowKind", TCExpr $ LabeledRowKindTC)
+  , ("pair", ConExpr $ ProdCon [(), ()])
+  , ("fstRef", OpExpr $ ProjRef 0 ())
+  , ("sndRef", OpExpr $ ProjRef 1 ())
+  , ("cast", OpExpr  $ CastOp () ())
+  , ("alloc", OpExpr $ IOAlloc (Scalar Word8Type) ())
+  , ("free" , OpExpr $ IOFree ())
+  , ("ptrOffset", OpExpr $ PtrOffset () ())
+  , ("ptrLoad"  , OpExpr $ PtrLoad ())
+  , ("ptrStore" , OpExpr $ PtrStore () ())
+  , ("dataConTag", OpExpr $ DataConTag ())
+  , ("toEnum"    , OpExpr $ ToEnum () ())
+  , ("outputStreamPtr", OpExpr $ OutputStreamPtr)
+  , ("projMethod0", OpExpr $ ProjMethod () 0)
+  , ("projMethod1", OpExpr $ ProjMethod () 1)
+  , ("projMethod2", OpExpr $ ProjMethod () 2)
+  , ("explicitDict", ConExpr $ ExplicitDict () ())
+  , ("explicitApply", OpExpr $ ExplicitApply () ())
+  , ("monoLit", OpExpr $ MonoLiteral ())
+  ]
+  where
+    binOp  op = OpExpr $ BinOp op () ()
+    unOp   op = OpExpr $ UnOp  op ()
+    ptrTy  ty = PtrType (Heap CPU, ty)

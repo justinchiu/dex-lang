@@ -12,7 +12,7 @@ import numpy as np
 
 import jax
 from jax.lib import xla_client as xc
-from jax.interpreters import xla
+from jax.interpreters import mlir
 from jax.interpreters import batching
 
 from ... import Atom
@@ -28,7 +28,7 @@ compiler_cache = WeakKeyDictionary()
 def get_compiled(func_atom):
   compiled = compiler_cache.get(func_atom, None)
   if compiled is None:
-    compiled = compiler_cache[func_atom] = func_atom.compile()
+    compiled = compiler_cache[func_atom] = func_atom.compile(calling_convention='xla')
   return compiled
 
 
@@ -94,53 +94,50 @@ PyCapsule_New.argtypes = (ctypes.c_void_p, ctypes.c_char_p, PyCapsule_Destructor
 def make_custom_call_target(func_ptr):
   return PyCapsule_New(func_ptr, b"xla._CUSTOM_CALL_TARGET", PyCapsule_Destructor(0))
 
-# TODO: Better lifetime management. func_atoms will be quite often created on the fly
-#       at trace time when different transforms are applied, and I'm pretty sure that
-#       the XLA executables outlive jaxprs formed by tracing.
-custom_call_id = count()
-custom_call_cache = {}
-def dex_call_cpu_translation(b, *args, func_atom):
-  xla_shapes = list(map(b.get_shape, args))
-  result_aval, shape_vars = dex_call_abstract_eval_with_shape(
-      *(jax.core.ShapedArray(xshape.dimensions(), xshape.numpy_dtype())
-        for xshape in xla_shapes),
-      func_atom=func_atom)
-  result_xshape = xc.Shape.array_shape(result_aval.dtype, result_aval.shape)
+trampoline_custom_call_name = None
+def get_trampoline():
+  global trampoline_custom_call_name
+  if trampoline_custom_call_name is not None:
+    return trampoline_custom_call_name
+  trampoline_custom_call_name = "dex_xla_cpu_trampoline"
+  xc.register_custom_call_target(
+      trampoline_custom_call_name.encode('ascii'),
+      make_custom_call_target(api.xlaCpuTrampoline))
+  return trampoline_custom_call_name
 
-  custom_call = custom_call_cache.get(func_atom, None)
+def dex_apply_lowering(ctx, *args, func_atom):
   native = get_compiled(func_atom)
-  if custom_call is None:
-    assert len(args) == len(native.explicit_argument_signature)
-    assert 1 == len(native.result_signature)
-    custom_call_ctype = ctypes.CFUNCTYPE(None,
-                                         ctypes.c_void_p,
-                                         ctypes.POINTER(ctypes.c_void_p * len(args)))
-    @custom_call_ctype
-    def trampoline(result_ptr, arg_ptr_array):
-      name_to_cval = {name: IdxRepTy(value) for name, value in shape_vars.items()}
-      for binder, ptr in zip(native.explicit_argument_signature, arg_ptr_array.contents):
-        if isinstance(binder.type, ScalarType):
-          cval = ctypes.cast(ptr, ctypes.POINTER(binder.type.arg_ctype)).contents
-        elif isinstance(binder.type, RectContArrayType):
-          cval = ctypes.cast(ptr, binder.type.arg_ctype)
-        else:
-          raise AssertionError("Unexpected binder type")
-        name_to_cval[binder.name] = cval
-      result_binder = native.result_signature[0]
-      name_to_cval[result_binder.name] = ctypes.cast(result_ptr, result_binder.type.ref_ctype)
-      native.callable(*(name_to_cval[name] for name in native.ccall_signature))
+  custom_call_name = get_trampoline()
+  ctx.module_context.add_keepalive(native)
 
-    trampoline_addr = ctypes.c_void_p.from_param(trampoline)
-    custom_call_name = f"dex_custom_call{next(custom_call_id)}".encode('ascii')
-    xc.register_custom_call_target(custom_call_name,
-                                   make_custom_call_target(trampoline_addr))
-    custom_call_cache[func_atom] = (custom_call_name, trampoline)
-    # TODO: Unregister custom calls at some point?
+  # TODO: Support inference of implicit arguments. Abstract eval already does inference!
+  if len(native.argument_signature) != len(native.explicit_argument_signature):
+    raise NotImplementedError("Inference of implicit arguments")
+  assert len(args) == len(native.explicit_argument_signature)
+
+  native_ptr = mlir.ir_constant(
+      ctypes.cast(native._as_parameter_, ctypes.c_void_p).value,
+      canonicalize_types=False)
+  result_type = [mlir.aval_to_ir_type(a) for a in ctx.avals_out]
+  multi_result = len(ctx.avals_out) > 1
+  if multi_result:
+    result_type = [mlir.ir.TupleType.get_tuple(result_type)]
+  custom_call = mlir.mhlo.CustomCallOp(
+      result_type,
+      (native_ptr, *args),
+      call_target_name=mlir.ir.StringAttr.get(custom_call_name),
+      has_side_effect=mlir.ir.BoolAttr.get(False),
+      api_version=mlir.i32_attr(2),
+      called_computations=mlir.ir.ArrayAttr.get([]),
+      backend_config=mlir.ir.StringAttr.get(""),
+      operand_layouts=None,
+      result_layouts=None)
+  if multi_result:
+    return [mlir.mhlo.GetTupleElementOp(custom_call.result, mlir.i32_attr(i)).result
+            for i in range(len(ctx.avals_out))]
   else:
-    custom_call_name, *_ = custom_call
-  return xc.ops.CustomCall(b, custom_call_name, operands=args, shape=result_xshape)
-
-jax.interpreters.xla.backend_specific_translations['cpu'][dex_apply_p] = dex_call_cpu_translation
+    return custom_call.result,
+mlir.register_lowering(dex_apply_p, dex_apply_lowering, platform='cpu')
 
 
 # === batching ===
@@ -346,7 +343,7 @@ def dex_call_evaluate_linearized_transpose(cotangents, *args, func_atom):
   # parameter at index 1, the evaluated string should look like:
   # ```
   # \ x0 x1 x2 u1 ct.
-  #   transposeLinear (\(t0, t2). linearized x0 x1 x2 t0 u1 t2) ct
+  #   transpose_linear (\(t0, t2). linearized x0 x1 x2 t0 u1 t2) ct
   # ```
   # - The `x` variables are the (constant) inputs to the primal function. These
   #   should always be supplied by JAX.
@@ -373,9 +370,9 @@ def dex_call_evaluate_linearized_transpose(cotangents, *args, func_atom):
       arg_string("x", range(num_primals)) + " " + linearized_tangent_inputs)
 
   # \ x0 x1 x2 u1 ct.
-  #   transposeLinear (\(t0, t2). linearized x0 x1 x2 t0 u1 t2) ct
+  #   transpose_linear (\(t0, t2). linearized x0 x1 x2 t0 u1 t2) ct
   transposed = module.eval(
-      f"\\ {transposed_atom_params}. transposeLinear " +
+      f"\\ {transposed_atom_params}. transpose_linear " +
       f"(\ {linear_lambda_params}. {linearized_name} {linearized_inputs}) ct"
   )
 

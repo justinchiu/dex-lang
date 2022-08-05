@@ -4,13 +4,10 @@
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE PartialTypeSignatures #-}
 
 module SourceRename ( renameSourceNamesTopUDecl, uDeclErrSourceMap
-                    , renameSourceNamesUExpr) where
+                    , renameSourceNamesUExpr ) where
 
 import Prelude hiding (id, (.))
 import Data.List (sort)
@@ -22,8 +19,11 @@ import qualified Data.Map.Strict as M
 import Err
 import LabeledItems
 import Name
-import Syntax
-import PPrint()
+import Core (EnvReader (..), withEnv, lookupSourceMapPure)
+import PPrint ()
+import Types.Source
+import Types.Primitives
+import Types.Core (Env (..), ModuleEnv (..))
 
 renameSourceNamesTopUDecl
   :: (Fallible1 m, EnvReader m)
@@ -34,15 +34,18 @@ renameSourceNamesTopUDecl mname decl = do
   let sourceMap = SourceMap $ fmap (fmap (\(LocalVar v) -> ModuleVar mname (Just v))) $
                     fromSourceMap sourceMapLocalNames
   return $ Abs renamedDecl sourceMap
+{-# SCC renameSourceNamesTopUDecl #-}
 
 uDeclErrSourceMap:: ModuleSourceName -> UDecl VoidS VoidS -> SourceMap n
 uDeclErrSourceMap mname decl =
   SourceMap $ M.fromSet (const [ModuleVar mname Nothing]) (sourceNames decl)
+{-# SCC uDeclErrSourceMap #-}
 
 renameSourceNamesUExpr :: (Fallible1 m, EnvReader m) => UExpr VoidS -> m n (UExpr n)
 renameSourceNamesUExpr expr = do
   Distinct <- getDistinct
   liftRenamer $ sourceRenameE expr
+{-# SCC renameSourceNamesUExpr #-}
 
 sourceRenameTopUDecl
   :: (Renamer m, Distinct o)
@@ -145,6 +148,20 @@ instance SourceRenamableE (SourceNameOr (Name ClassNameC)) where
       _ -> throw TypeErr $ "Not a class name: " ++ pprint sourceName
   sourceRenameE _ = error "Shouldn't be source-renaming internal names"
 
+instance SourceRenamableE (SourceNameOr (Name EffectNameC)) where
+  sourceRenameE (SourceName sourceName) = do
+    lookupSourceName sourceName >>= \case
+      UEffectVar v -> return $ InternalName sourceName v
+      _ -> throw TypeErr $ "Not an effect name: " ++ pprint sourceName
+  sourceRenameE _ = error "Shouldn't be source-renaming internal names"
+
+instance SourceRenamableE (SourceNameOr (Name HandlerNameC)) where
+  sourceRenameE (SourceName sourceName) = do
+    lookupSourceName sourceName >>= \case
+      UHandlerVar v -> return $ InternalName sourceName v
+      _ -> throw TypeErr $ "Not a handler name: " ++ pprint sourceName
+  sourceRenameE _ = error "Shouldn't be source-renaming internal names"
+
 instance (SourceRenamableE e, SourceRenamableB b) => SourceRenamableE (Abs b e) where
   sourceRenameE (Abs b e) = sourceRenameB b \b' -> Abs b' <$> sourceRenameE e
 
@@ -176,7 +193,14 @@ instance SourceRenamableE UExpr' where
     UPi (UPiExpr arr pat eff body) ->
       sourceRenameB pat \pat' ->
         UPi <$> (UPiExpr arr pat' <$> sourceRenameE eff <*> sourceRenameE body)
-    UApp arr f x -> UApp arr <$> sourceRenameE f <*> sourceRenameE x
+    UApp f x -> UApp <$> sourceRenameE f <*> sourceRenameE x
+    UTabLam (UTabLamExpr pat body) ->
+      sourceRenameB pat \pat' ->
+        UTabLam <$> UTabLamExpr pat' <$> sourceRenameE body
+    UTabPi (UTabPiExpr pat body) ->
+      sourceRenameB pat \pat' ->
+        UTabPi <$> (UTabPiExpr pat' <$> sourceRenameE body)
+    UTabApp f x -> UTabApp <$> sourceRenameE f <*> sourceRenameE x
     UDecl (UDeclExpr decl rest) ->
       sourceRenameB decl \decl' ->
         UDecl <$> UDeclExpr decl' <$> sourceRenameE rest
@@ -188,8 +212,6 @@ instance SourceRenamableE UExpr' where
     UHole -> return UHole
     UTypeAnn e ty -> UTypeAnn <$> sourceRenameE e <*> sourceRenameE ty
     UTabCon xs -> UTabCon <$> mapM sourceRenameE xs
-    UIndexRange low high ->
-      UIndexRange <$> mapM sourceRenameE low <*> mapM sourceRenameE high
     UPrimExpr e -> UPrimExpr <$> mapM sourceRenameE e
     ULabel name -> return $ ULabel name
     URecord elems -> URecord <$> mapM sourceRenameE elems
@@ -200,6 +222,7 @@ instance SourceRenamableE UExpr' where
     URecordTy elems -> URecordTy <$> mapM sourceRenameE elems
     UVariantTy (Ext tys ext) -> UVariantTy <$>
       (Ext <$> mapM sourceRenameE tys <*> mapM sourceRenameE ext)
+    UNatLit   x -> return $ UNatLit x
     UIntLit   x -> return $ UIntLit x
     UFloatLit x -> return $ UFloatLit x
 
@@ -260,6 +283,17 @@ instance SourceRenamableB UDecl where
         sourceRenameE $ Abs conditions (PairE (ListE params) $ ListE methodDefs)
       sourceRenameB instanceName \instanceName' ->
         cont $ UInstance className' conditions' params' methodDefs' instanceName'
+    UEffectDecl opTypes effName opNames -> do
+      opTypes' <- mapM (\(UEffectOpType p ty) -> (UEffectOpType p) <$> sourceRenameE ty) opTypes
+      sourceRenameUBinder UEffectVar effName \effName' ->
+        sourceRenameUBinderNest UEffectOpVar opNames \opNames' ->
+          cont $ UEffectDecl opTypes' effName' opNames'
+    UHandlerDecl effName tyArgs retEff retTy ops handlerName -> do
+      effName' <- sourceRenameE effName
+      Abs tyArgs' (ListE ops' `PairE` retEff' `PairE` retTy') <-
+        sourceRenameE (Abs tyArgs (ListE ops `PairE` retEff `PairE` retTy))
+      sourceRenameUBinder UHandlerVar handlerName \handlerName' -> do
+        cont $ UHandlerDecl effName' tyArgs' retEff' retTy' ops' handlerName'
 
 renameMethodType :: (Fallible1 m, Renamer m, Distinct o)
                  => Nest (UAnnBinder AtomNameC) i' i
@@ -355,6 +389,12 @@ instance SourceRenamableE UMethodDef where
     lookupSourceName v >>= \case
       UMethodVar v' -> UMethodDef (InternalName v v') <$> sourceRenameE expr
       _ -> throw TypeErr $ "not a method name: " ++ pprint v
+
+instance SourceRenamableE UEffectOpDef where
+  sourceRenameE (UEffectOpDef ~(SourceName v) rp expr) = do
+    lookupSourceName v >>= \case
+      UEffectOpVar v' -> UEffectOpDef (InternalName v v') rp <$> sourceRenameE expr
+      _ -> throw TypeErr $ "not an effect operation name: " ++ pprint v
 
 instance SourceRenamableB b => SourceRenamableB (Nest b) where
   sourceRenameB (Nest b bs) cont =
@@ -484,6 +524,9 @@ instance HasSourceNames UDecl where
     UInterface _ _ _ ~(UBindSource className) methodNames -> do
       S.singleton className <> sourceNames methodNames
     UInstance _ _ _ _ instanceName -> sourceNames instanceName
+    UEffectDecl _ ~(UBindSource effName) opNames -> do
+      S.singleton effName <> sourceNames opNames
+    UHandlerDecl _ _ _ _ _ handlerName -> sourceNames handlerName
 
 instance HasSourceNames UPat where
   sourceNames (WithSrcB _ pat) = case pat of

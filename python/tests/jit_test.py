@@ -39,7 +39,7 @@ class JITTest(unittest.TestCase):
                              ((x + 0.01, y) for x, y in it.product(example_floats, repeat=2)
                               if (x, y) != (0.0, 0.0)))
 
-  test_int_arg = expr_test(r"\x:Int64 y:Int. I64ToI x + y",
+  test_int_arg = expr_test(r"\x:Int64 y:Int. i64_to_i x + y",
                            lambda x, y: x + y,
                            it.product(example_ints, example_ints))
 
@@ -47,7 +47,7 @@ class JITTest(unittest.TestCase):
                                 np.sum,
                                 [(np.arange(10, dtype=np.float32),)])
 
-  test_scalar_array = expr_test(r"\x:Int. for i:(Fin 10). x + ordinal i",
+  test_scalar_array = expr_test(r"\x:Int. for i:(Fin 10). x + n_to_i (ordinal i)",
                                 lambda x: x + np.arange(10, dtype=np.int32),
                                 [(i,) for i in range(5)])
 

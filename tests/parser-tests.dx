@@ -43,11 +43,11 @@ f = \x. x + 10.
 
 lam1 = \{n}. \x:(Fin n). ordinal x
 :t lam1
-> ((n:Int32) ?-> (Fin n) -> Int32)
+> ((n:Nat) ?-> (Fin n) -> Nat)
 
 lam4 = \{n m}. (Fin n, Fin m)
 :t lam4
-> (Int32 ?-> Int32 ?-> (Type & Type))
+> (Nat ?-> Nat ?-> (Type & Type))
 
 :p (
     1
@@ -65,7 +65,7 @@ lam4 = \{n m}. (Fin n, Fin m)
 > [1, 0, 0]
 
 :p
-  runState 5 \ref.
+  run_state 5 \ref.
     n = get ref
     for_ i:(Fin n).
       ref := get ref + 1
@@ -84,7 +84,7 @@ def myInt2 : {State Int} Int = 1
 > Nullary def can't have effects
 
 :p
-  yieldAccum (AddMonoid Float) \ref.
+  yield_accum (AddMonoid Float) \ref.
     x = if True then 1. else 3.
     if True then ref += x
 
@@ -99,3 +99,14 @@ def myInt2 : {State Int} Int = 1
     if True
       then ref += 2.
 > 9.
+
+-- Check that a syntax error in a funDefLet doesn't try to reparse the
+-- whole definition as something it's not.
+def frob (x:Int) (y:Int) : + =
+
+> Parse error:105:30:
+>     |
+> 105 | def frob (x:Int) (y:Int) : + =
+>     |                              ^
+> unexpected '='
+> expecting expression or resume

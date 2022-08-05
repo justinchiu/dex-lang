@@ -4,28 +4,23 @@
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE DerivingVia #-}
-{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 module TopLevel (
   EvalConfig (..), Topper, runTopperM,
-  evalSourceBlock, evalSourceBlockRepl,
-  evalFile, evalSourceText, initTopState, TopStateEx (..),
+  evalSourceBlock, evalSourceBlockRepl, OptLevel (..),
+  evalSourceText, initTopState, TopStateEx (..), LibPath (..),
   evalSourceBlockIO, loadCache, storeCache, clearCache) where
 
+import Data.Maybe
+import Data.Foldable (toList)
 import Data.Functor
 import Control.Exception (throwIO, catch)
 import Control.Monad.Writer.Strict  hiding (pass)
 import Control.Monad.State.Strict
 import Control.Monad.Reader
 import qualified Data.ByteString as BS
+import Data.Text (Text)
 import Data.Text.Prettyprint.Doc
 import Data.Store (Store (..), encode, decode)
 import Data.List (partition)
@@ -34,7 +29,7 @@ import qualified Data.Set        as S
 import GHC.Generics (Generic (..))
 import System.FilePath
 import System.Directory
-import System.IO (stderr, hPutStrLn)
+import System.IO (stderr, hPutStrLn, Handle)
 import System.IO.Error (isDoesNotExistError)
 
 import Paths_dex  (getDataFileName)
@@ -50,30 +45,46 @@ import Serialize (HasPtrs (..), pprintVal, getDexString, takePtrSnapshot, restor
 import Name
 import Parser
 import Syntax
+import Core
+import Types.Core
 import Builder
-import Type
+import CheckType ( CheckableE (..), asFFIFunType, checkHasType, asSpecializableFunction)
+#ifdef DEX_DEBUG
+import Types.Primitives
+import CheckType (checkTypesM)
+#endif
 import SourceRename
 import Inference
 import Simplify
+import Lower
 import Imp
 import JIT
+import Optimize
+import QueryType
 
 -- === top-level monad ===
 
+data LibPath = LibDirectory FilePath | LibBuiltinPath
+data OptLevel = NoOptimize | Optimize
+
 data EvalConfig = EvalConfig
-  { backendName :: Backend
-  , libPath     :: Maybe FilePath
-  , preludeFile :: Maybe FilePath
-  , logFile     :: Maybe FilePath }
+  { backendName   :: Backend
+  , libPaths      :: [LibPath]
+  , preludeFile   :: Maybe FilePath
+  , logFileName   :: Maybe FilePath
+  , logFile       :: Maybe Handle
+  , optLevel      :: OptLevel }
 
 class Monad m => ConfigReader m where
   getConfig :: m EvalConfig
 
 data PassCtx = PassCtx
-  { requiresBench :: Bool }
+  { requiresBench :: Bool
+  , shouldLogPass :: PassName -> Bool
+  }
 
 initPassCtx :: PassCtx
-initPassCtx = PassCtx False
+initPassCtx = PassCtx False (const True)
 
 class Monad m => PassCtxReader m where
   getPassCtx :: m PassCtx
@@ -124,12 +135,20 @@ evalSourceBlockIO :: EvalConfig -> TopStateEx -> SourceBlock -> IO (Result, TopS
 evalSourceBlockIO opts env block = runTopperM opts env $ evalSourceBlockRepl block
 
 -- Used for the top-level source file (rather than imported modules)
-evalSourceText :: (Topper m, Mut n) => String -> m n [(SourceBlock, Result)]
-evalSourceText source = do
+evalSourceText :: (Topper m, Mut n) => Text -> (SourceBlock -> IO ()) -> (Result -> IO Bool) -> m n [(SourceBlock, Result)]
+evalSourceText source beginCallback endCallback = do
   let (UModule mname deps sourceBlocks) = parseUModule Main source
   mapM_ ensureModuleLoaded deps
-  results <- mapM (evalSourceBlock mname) sourceBlocks
-  return $ zip sourceBlocks results
+  evalSourceBlocks mname sourceBlocks
+  where
+    evalSourceBlocks mname = \case
+      [] -> return []
+      (sb:rest) -> do
+        liftIO $ beginCallback sb
+        result <- evalSourceBlock mname sb
+        liftIO (endCallback result) >>= \case
+          False -> return [(sb, result)]
+          True  -> ((sb, result):) <$> evalSourceBlocks mname rest
 
 catchLogsAndErrs :: (Topper m, Mut n) => m n a -> m n (Except a, [Output])
 catchLogsAndErrs m = do
@@ -159,13 +178,15 @@ ensureModuleLoaded moduleSourceName = do
   forM_ depsRequired \md -> do
     evaluated <- evalPartiallyParsedUModuleCached md
     bindModule (umppName md) evaluated
+{-# SCC ensureModuleLoaded #-}
 
 evalSourceBlock :: (Topper m, Mut n)
                 => ModuleSourceName -> SourceBlock -> m n Result
 evalSourceBlock mname block = do
   result <- withCompileTime do
      (maybeErr, logs) <- catchLogsAndErrs $
-       withPassCtx (PassCtx $ blockRequiresBench block) $
+       withPassCtx (PassCtx (blockRequiresBench block)
+                            (passLogFilter $ sbLogLevel block)) $
          evalSourceBlock' mname block
      return $ Result logs maybeErr
   case resultErrs result of
@@ -174,19 +195,22 @@ evalSourceBlock mname block = do
       _ -> return ()
     _ -> return ()
   return $ filterLogs block $ addResultCtx block result
+{-# SCC evalSourceBlock #-}
 
 evalSourceBlock' :: (Topper m, Mut n) => ModuleSourceName -> SourceBlock -> m n ()
 evalSourceBlock' mname block = case sbContents block of
   EvalUDecl decl -> execUDecl mname decl
   Command cmd expr -> case cmd of
     EvalExpr fmt -> do
-      val <- evalUExpr expr
+      annExpr <- case fmt of
+        Printed -> return expr
+        RenderHtml -> return $ addTypeAnn expr $ referTo "String"
+      val <- evalUExpr annExpr
       case fmt of
         Printed -> do
           s <- pprintVal val
           logTop $ TextOut s
         RenderHtml -> do
-          -- TODO: check types before we get here
           s <- getDexString val
           logTop $ HtmlOut s
     ExportFun _ -> error "not implemented"
@@ -209,10 +233,108 @@ evalSourceBlock' mname block = case sbContents block of
         -- TODO: query linking stuff and check the function is actually available
         let hint = getNameHint b
         vImp  <- emitImpFunBinding hint $ FFIFunction impFunTy fname
-        vCore <- emitBinding hint (AtomNameBinding $ FFIFunBound naryPiTy vImp)
+        vCore <- emitBinding hint (AtomNameBinding $ TopFunBound naryPiTy $ FFITopFun vImp)
         UBindSource sourceName <- return b
         emitSourceMap $ SourceMap $
           M.singleton sourceName [ModuleVar mname (Just $ UAtomVar vCore)]
+  DeclareCustomLinearization fname zeros expr -> do
+    lookupSourceMap fname >>= \case
+      Nothing -> throw UnboundVarErr $ pprint fname
+      Just (UAtomVar fname') -> do
+        lookupCustomRules fname' >>= \case
+          Nothing -> return ()
+          Just _  -> throw TypeErr $ pprint fname ++ " already has a custom linearization"
+        -- We do some special casing to avoid instantiating polymorphic functions.
+        impl <- case expr of
+          WithSrcE _ (UVar _) ->
+            renameSourceNamesUExpr expr >>= \case
+              WithSrcE _ (UVar (InternalName _ (UAtomVar v))) -> return $ Var v
+              _ -> error "Expected a variable"
+          _ -> evalUExpr expr
+        fType <- getType fname'
+        (nimplicit, linFunTy) <- liftExcept . runFallibleM =<< liftEnvReaderT
+          (getLinearizationType fType REmpty [] fType)
+        impl `checkHasType` linFunTy >>= \case
+          Failure _ -> do
+            implTy <- getType impl
+            throw TypeErr $ unlines
+              [ "Expected the custom linearization to have type:"
+              , ""
+              , pprint linFunTy
+              , ""
+              , "but it has type:"
+              , ""
+              , pprint implTy
+              ]
+          Success () -> return ()
+        emitAtomRules fname' $ CustomLinearize nimplicit zeros impl
+      Just _ -> throw TypeErr $ "Custom linearization can only be defined for functions"
+    where
+      getLinearizationType :: Type n -> RNest PiBinder n l
+                           -> [Type l] -> Type l -> EnvReaderT FallibleM l (Int, Type n)
+      getLinearizationType fullTy implicitArgs revArgTys = \case
+        Pi (PiType pbinder@(PiBinder binder a arr) eff b') -> do
+          unless (eff == Pure) $ throw TypeErr $
+            "Custom linearization can only be defined for pure functions" ++ but
+          let implicit = do
+                unless (null revArgTys) $ throw TypeErr $
+                  "To define a custom linearization, all implicit and class arguments of " ++
+                  "a function have to precede all explicit arguments. However, the " ++
+                  "type of " ++ pprint fname ++ "is:\n\n" ++ pprint fullTy
+                refreshAbs (Abs pbinder b') \pbinder' b'' ->
+                  getLinearizationType fullTy (RNest implicitArgs pbinder') [] b''
+          case arr of
+            ClassArrow -> implicit
+            ImplicitArrow -> implicit
+            PlainArrow -> do
+              b <- case hoist binder b' of
+                HoistSuccess b -> return b
+                HoistFailure _ -> throw TypeErr $
+                  "Custom linearization cannot be defined for dependent functions" ++ but
+              getLinearizationType fullTy implicitArgs (a:revArgTys) b
+            LinArrow -> throw NotImplementedErr "Unexpected linear arrow"
+        resultTy -> do
+          when (null revArgTys) $ throw TypeErr $
+            "Custom linearization can only be defined for functions" ++ but
+          resultTyTan <- maybeTangentType resultTy >>= \case
+            Just rtt -> return rtt
+            Nothing  -> throw TypeErr $ unlines
+              [ "The type of the result of " ++ pprint fname ++ " is:"
+              , ""
+              , "  " ++ pprint resultTy
+              , ""
+              , "but it does not have a well-defined tangent space."
+              ]
+          tangentWrapper <- case zeros of
+            InstantiateZeros -> return id
+            SymbolicZeros -> do
+              lookupSourceMap "SymbolicTangent" >>= \case
+                Nothing -> throw UnboundVarErr $
+                  "Can't define a custom linearization with symbolic zeros: the " ++
+                  "SymbolicTangent type is not in scope."
+                Just (UTyConVar symTanName) -> do
+                  TyConBinding dataDefName _ <- lookupEnv symTanName
+                  return \elTy -> TypeCon "SymbolicTangent" dataDefName $ DataDefParams [elTy] []
+                Just _ -> throw TypeErr "SymbolicTangent should name a `data` type"
+          let prependTangent linTail ty =
+                maybeTangentType ty >>= \case
+                  Just tty -> tangentWrapper tty --> linTail
+                  Nothing  -> throw TypeErr $ unlines
+                    [ "The type of one of the arguments of " ++ pprint fname ++ " is:"
+                    , ""
+                    , "  " ++ pprint ty
+                    , ""
+                    , "but it doesn't have a well-defined tangent space."
+                    ]
+          tanFunTy <- foldM prependTangent resultTyTan revArgTys
+          (nestLength $ unRNest implicitArgs,) . prependImplicit implicitArgs <$>
+            foldM (flip (-->)) (PairTy resultTy tanFunTy) revArgTys
+        where
+          but = ", but " ++ pprint fname ++ " has type " ++ pprint fullTy
+          prependImplicit :: RNest PiBinder n l -> Type l -> Type n
+          prependImplicit is ty = case is of
+            REmpty -> ty
+            RNest is' i -> prependImplicit is' $ Pi $ PiType i Pure ty
   GetNameType v -> do
     ty <- sourceNameType v
     logTop $ TextOut $ pprintCanonicalized ty
@@ -222,6 +344,11 @@ evalSourceBlock' mname block = case sbContents block of
   CommentLine  -> return ()
   EmptyLines   -> return ()
   UnParseable _ s -> throw ParseErr s
+  where
+    addTypeAnn :: UExpr n -> UExpr n -> UExpr n
+    addTypeAnn e = WithSrcE Nothing . UTypeAnn e
+    referTo :: SourceName -> UExpr VoidS
+    referTo = WithSrcE Nothing . UVar . SourceName
 
 runEnvQuery :: Topper m => EnvQuery -> m n ()
 runEnvQuery query = do
@@ -230,20 +357,22 @@ runEnvQuery query = do
     DumpSubst -> logTop $ TextOut $ pprint $ env
     InternalNameInfo name ->
       case lookupSubstFragRaw (fromRecSubst $ envDefs $ topEnv env) name of
-        Nothing -> throw UnboundVarErr $ pprint name
-        Just (WithColor binding) ->
-          logTop $ TextOut $ pprint binding
+        Nothing      -> throw UnboundVarErr $ pprint name
+        Just binding -> logTop $ TextOut $ pprint binding
     SourceNameInfo name -> do
       lookupSourceMap name >>= \case
         Nothing -> throw UnboundVarErr $ pprint name
         Just uvar -> do
           logTop $ TextOut $ pprint uvar
           info <- case uvar of
-            UAtomVar    v' -> pprint <$> lookupEnv v'
-            UTyConVar   v' -> pprint <$> lookupEnv v'
-            UDataConVar v' -> pprint <$> lookupEnv v'
-            UClassVar   v' -> pprint <$> lookupEnv v'
-            UMethodVar  v' -> pprint <$> lookupEnv v'
+            UAtomVar     v' -> pprint <$> lookupEnv v'
+            UTyConVar    v' -> pprint <$> lookupEnv v'
+            UDataConVar  v' -> pprint <$> lookupEnv v'
+            UClassVar    v' -> pprint <$> lookupEnv v'
+            UMethodVar   v' -> pprint <$> lookupEnv v'
+            UEffectVar   v' -> pprint <$> lookupEnv v'
+            UEffectOpVar v' -> pprint <$> lookupEnv v'
+            UHandlerVar  v' -> pprint <$> lookupEnv v'
           logTop $ TextOut $ "Binding:\n" ++ info
 
 blockRequiresBench :: SourceBlock -> Bool
@@ -335,9 +464,9 @@ evalPartiallyParsedUModule partiallyParsed = do
 evalUModule :: (Topper m  ,Mut n) => UModule -> m n (Module n)
 evalUModule (UModule name _ blocks) = do
   Abs topFrag UnitE <- localTopBuilder $ mapM_ (evalSourceBlock' name) blocks >> return UnitE
-  TopEnvFrag envFrag (PartialTopEnvFrag cache loadedModules moduleEnv) <- return topFrag
+  TopEnvFrag envFrag (PartialTopEnvFrag cache rules loadedModules moduleEnv) <- return topFrag
   ModuleEnv (ImportStatus directDeps transDeps) sm scs objs _ <- return moduleEnv
-  let fragToReEmit = TopEnvFrag envFrag $ PartialTopEnvFrag cache loadedModules mempty
+  let fragToReEmit = TopEnvFrag envFrag $ PartialTopEnvFrag cache rules loadedModules mempty
   let evaluatedModule = Module name directDeps transDeps sm scs objs
   emitEnv $ Abs fragToReEmit evaluatedModule
 
@@ -349,9 +478,15 @@ importModule name = do
       Module _ _ transImports' _ _ _ <- lookupModule name'
       let importStatus = ImportStatus (S.singleton name') (S.singleton name' <> transImports')
       emitLocalModuleEnv $ mempty { envImportStatus = importStatus }
+{-# SCC importModule #-}
 
-evalFile :: (Topper m, Mut n) => FilePath -> m n [(SourceBlock, Result)]
-evalFile fname = evalSourceText =<< (liftIO $ readFile fname)
+passLogFilter :: LogLevel -> PassName -> Bool
+passLogFilter = \case
+  LogAll           -> const True
+  LogNothing       -> const False
+  LogPasses passes -> (`elem` passes)
+  PrintEvalTime    -> const False
+  PrintBench _     -> const False
 
 processLogs :: LogLevel -> [Output] -> [Output]
 processLogs logLevel logs = case logLevel of
@@ -400,13 +535,34 @@ evalUExpr expr = do
   renamed <- logPass RenamePass $ renameSourceNamesUExpr expr
   typed <- checkPass TypePass $ inferTopUExpr renamed
   evalBlock typed
+{-# SCC evalUExpr #-}
 
 evalBlock :: (Topper m, Mut n) => Block n -> m n (Atom n)
 evalBlock typed = do
-  synthed <- checkPass SynthPass $ synthTopBlock typed
-  SimplifiedBlock simp recon <- checkPass SimpPass $ simplifyTopBlock synthed
-  result <- evalBackend simp
+  eopt <- checkPass EarlyOptPass $ earlyOptimize typed
+  synthed <- checkPass SynthPass $ synthTopBlock eopt
+  simplifiedBlock <- checkPass SimpPass $ simplifyTopBlock synthed
+  evalRequiredSpecializations simplifiedBlock
+  SimplifiedBlock simp recon <- return simplifiedBlock
+  opt <- (fmap optLevel getConfig) >>= \case
+    Optimize   -> checkPass OptPass $ optimize simp
+    NoOptimize -> return simp
+  lowered <- checkPass LowerPass $ lowerFullySequential opt
+  result <- evalBackend lowered
   applyRecon recon result
+{-# SCC evalBlock #-}
+
+evalRequiredSpecializations
+  :: (Topper m, Mut n, SinkableE e, SubstE Name e, HoistableE e)
+  => e n -> m n ()
+evalRequiredSpecializations e = do
+  forM_ (freeAtomVarsList e) \v -> do
+    lookupAtomName v >>= \case
+      TopFunBound _ (SpecializedTopFun _) ->
+        queryImpCache v >>= \case
+          Nothing -> compileTopLevelFun v
+          Just _ -> return ()
+      _ -> return ()
 
 execUDecl :: (Topper m, Mut n) => ModuleSourceName -> UDecl VoidS VoidS -> m n ()
 execUDecl mname decl = do
@@ -417,32 +573,70 @@ execUDecl mname decl = do
     UDeclResultWorkRemaining block declAbs -> do
       result <- evalBlock block
       result' <- case declAbs of
-        Abs (ULet NoInlineLet (UPatAnn p _) _) _ ->
-          compileTopLevelFun (getNameHint p) result
+        Abs (ULet NoInlineLet (UPatAnn p _) _) _ -> do
+          ty <- getType result
+          asSpecializableFunction ty >>= \case
+            Just (n, fty) -> do
+              f <- emitBinding (getNameHint p) $
+                AtomNameBinding $ TopFunBound fty $ UnspecializedTopFun n result
+              -- warm up cache if it's already sufficiently specialized
+              -- (this is actually here as a workaround for some sort of
+              -- caching/linking bug that occurs when we deserialize compilation artifacts).
+              when (n == 0) do
+                let s = AppSpecialization f (Abs Empty (ListE []))
+                fSpecial <- emitSpecialization s
+                evalRequiredSpecializations (Var fSpecial)
+              return $ Var f
+            Nothing -> throw TypeErr $
+              "Not a valid @noinline function type: " ++ pprint ty
         _ -> return result
       emitSourceMap =<< applyUDeclAbs declAbs result'
     UDeclResultDone sourceMap' -> emitSourceMap sourceMap'
+{-# SCC execUDecl #-}
 
-compileTopLevelFun :: (Topper m, Mut n) => NameHint -> Atom n -> m n (Atom n)
-compileTopLevelFun hint f = do
-  ty <- getType f
-  naryPi <- asFirstOrderFunction ty >>= \case
-    Nothing -> throw TypeErr "@noinline functions must be first-order"
-    Just naryPi -> return naryPi
-  fSimp <- simplifyTopFunction naryPi f
+compileTopLevelFun
+  :: (Topper m, Mut n)
+  => AtomName n -> m n ()
+compileTopLevelFun fname = do
+  fPreSimp <- specializedFunPreSimpDefinition fname
+  fSimp <- simplifyTopFunction fPreSimp
+  evalRequiredSpecializations fSimp
   fImp <- toImpStandaloneFunction fSimp
-  fSimpName <- emitBinding hint $ AtomNameBinding $ SimpLamBound naryPi fSimp
-  fImpName <- emitImpFunBinding hint fImp
-  extendImpCache fSimpName fImpName
+  fImpName <- emitImpFunBinding (getNameHint fname) fImp
+  extendImpCache fname fImpName
   -- TODO: this is a hack! We need a better story for C/LLVM names.
   let cFunName = pprint fImpName
   fObj <- toCFunction cFunName fImp
   extendObjCache fImpName fObj
-  return $ Var fSimpName
+{-# SCC compileTopLevelFun #-}
+
+-- Get the definition of a specialized function in the pre-simplification IR.
+specializedFunPreSimpDefinition
+  :: (MonadFail1 m, EnvReader m) => AtomName n -> m n (NaryLamExpr n)
+specializedFunPreSimpDefinition fname = do
+  TopFunBound ty (SpecializedTopFun s) <- lookupAtomName fname
+  AppSpecialization f abStaticArgs@(Abs bs _) <- return s
+  f' <- forceDeferredInlining f
+  liftBuilder do
+    buildNaryLamExpr ty \allArgs -> do
+      let (extraArgs, originalArgs) = splitAt (nestLength bs) (toList allArgs)
+      ListE staticArgs' <- applyNaryAbs (sink abStaticArgs) extraArgs
+      naryApp (sink f') $ staticArgs' <> map Var originalArgs
+
+-- This is needed to avoid an infinite loop. Otherwise, in simplifyTopFunction,
+-- where we eta-expand and try to simplify `App f args`, we would see `f` as a
+-- "noinline" function and defer its simplification.
+forceDeferredInlining :: EnvReader m => AtomName n -> m n (Atom n)
+forceDeferredInlining v =
+  lookupAtomName v >>= \case
+    TopFunBound _ (UnspecializedTopFun _ f) -> return f
+    _ -> return $ Var v
 
 toCFunction :: (Topper m, Mut n) => SourceName -> ImpFunction n -> m n (CFun n)
 toCFunction fname f = do
-  (deps, m) <- impToLLVM fname f
+  PassCtx{..} <- getPassCtx
+  logger  <- getLogger
+  (deps, m) <- impToLLVM (FilteredLogger shouldLogPass logger) fname f
   objFile <- liftIO $ exportObjectFileVal deps m fname
   objFileName <- emitObjFile (getNameHint fname) objFile
   return $ CFun fname objFileName
@@ -455,24 +649,26 @@ mainFuncName = "entryFun"
 evalLLVM :: (Topper m, Mut n) => Block n -> m n (Atom n)
 evalLLVM block = do
   backend <- backendName <$> getConfig
-  bench   <- requiresBench <$> getPassCtx
+  PassCtx{..} <- getPassCtx
+  logger  <- getLogger
+  let filteredLogger = FilteredLogger shouldLogPass logger
   (blockAbs, ptrVals) <- abstractPtrLiterals block
   let (cc, needsSync) = case backend of LLVMCUDA -> (EntryFun CUDARequired   , True )
                                         _        -> (EntryFun CUDANotRequired, False)
   ImpFunctionWithRecon impFun reconAtom <- checkPass ImpPass $
                                              toImpFunction backend cc blockAbs
-  (_, llvmAST) <- impToLLVM mainFuncName impFun
+  (_, llvmAST) <- impToLLVM filteredLogger mainFuncName impFun
   let IFunType _ _ resultTypes = impFunType impFun
-  let llvmEvaluate = if bench then compileAndBench needsSync else compileAndEval
-  logger  <- getLogger
+  let llvmEvaluate = if requiresBench then compileAndBench needsSync else compileAndEval
   objFileNames <- getAllRequiredObjectFiles
   objFiles <- forM objFileNames  \objFileName -> do
     ObjectFileBinding objFile <- lookupEnv objFileName
     return objFile
-  resultVals <- liftIO $ llvmEvaluate logger objFiles
+  resultVals <- liftIO $ llvmEvaluate filteredLogger objFiles
                   llvmAST mainFuncName ptrVals resultTypes
   resultValsNoPtrs <- mapM litValToPointerlessAtom resultVals
   applyNaryAbs reconAtom $ map SubstVal resultValsNoPtrs
+{-# SCC evalLLVM #-}
 
 evalBackend :: (Topper m, Mut n) => Block n -> m n (Atom n)
 evalBackend (AtomicBlock result) = return result
@@ -497,9 +693,15 @@ checkPass name cont = do
   result <- logPass name do
     result <- cont
     return result
+#ifdef DEX_DEBUG
   logTop $ MiscLog $ "Running checks"
-  checkTypesM result
+  let allowedEffs = case name of LowerPass -> singletonEffRow IOEffect; _ -> mempty
+  {-# SCC afterPassTypecheck #-} (liftExcept =<<) $ liftEnvReaderT $
+    withAllowedEffects allowedEffs $ checkTypesM result
   logTop $ MiscLog $ "Checks passed"
+#else
+  logTop $ MiscLog $ "Checks skipped (not a debug build)"
+#endif
   return result
 
 addResultCtx :: SourceBlock -> Result -> Result
@@ -514,10 +716,10 @@ logPass passName cont = do
   logTop $ PassInfo passName $ "=== " <> pprint passName <> " ==="
   logTop $ MiscLog $ "Starting "++ pprint passName
   result <- cont
-  logTop $ PassInfo passName $ "=== Result ===\n" <> pprint result
+  {-# SCC logPassPrinting #-} logTop $ PassInfo passName $ "=== Result ===\n" <> pprint result
   return result
 
-loadModuleSource :: MonadIO m => EvalConfig -> ModuleSourceName -> m File
+loadModuleSource :: (MonadIO m, Fallible m) => EvalConfig -> ModuleSourceName -> m File
 loadModuleSource config moduleName = do
   fullPath <- case moduleName of
     OrdinaryModule moduleName' -> findFullPath $ moduleName' ++ ".dx"
@@ -527,10 +729,21 @@ loadModuleSource config moduleName = do
     Main -> error "shouldn't be trying to load the source for main"
   readFileWithHash fullPath
   where
-    findFullPath :: MonadIO m => FilePath -> m FilePath
-    findFullPath fname = case libPath config of
-      Nothing -> liftIO $ getDataFileName $ "lib/" ++ fname
-      Just path -> return $ path </> fname
+    findFullPath :: (MonadIO m, Fallible m) => String -> m FilePath
+    findFullPath fname = do
+      fsPaths <- liftIO $ traverse resolveBuiltinPath $ libPaths config
+      liftIO (findFile fsPaths fname) >>= \case
+        Just fpath -> return fpath
+        Nothing    -> throw ModuleImportErr $ unlines
+          [ "Couldn't find a source file for module " ++
+            (case moduleName of OrdinaryModule n -> n; Prelude -> "prelude"; Main -> error "")
+          , "Hint: Consider extending --lib-path?"
+          ]
+
+    resolveBuiltinPath = \case
+      LibBuiltinPath   -> liftIO $ getDataFileName "lib"
+      LibDirectory dir -> return dir
+{-# SCC loadModuleSource #-}
 
 -- === saving cache to disk ===
 
@@ -548,6 +761,7 @@ loadCache = liftIO do
         Right result -> restorePtrSnapshots result
         _            -> removeFile cachePath >> return initTopState
     else return initTopState
+{-# SCC loadCache #-}
 
 storeCache :: MonadIO m => TopStateEx -> m ()
 storeCache env = liftIO do
@@ -555,6 +769,7 @@ storeCache env = liftIO do
   createDirectoryIfMissing True =<< getCacheDir
   envToStore <- snapshotPtrs $ stripEnvForSerialization env
   BS.writeFile cachePath $ encode envToStore
+{-# SCC storeCache #-}
 
 getCacheDir :: MonadIO m => m FilePath
 getCacheDir = liftIO $ getXdgDirectory XdgCache "dex"
@@ -572,10 +787,15 @@ clearCache = liftIO do
 -- TODO: real garbage collection (maybe leave it till after we have a
 -- database-backed cache and we can do it incrementally)
 stripEnvForSerialization :: TopStateEx -> TopStateEx
-stripEnvForSerialization (TopStateEx (Env (TopEnv _ (RecSubst defs) cache _) _)) =
-  collectGarbage (RecSubstFrag defs) cache \d@(RecSubstFrag defs') cache' -> do
-    let scope = Scope $ toScopeFrag d
-    TopStateEx $ Env (TopEnv scope (RecSubst defs') cache' mempty) emptyModuleEnv
+stripEnvForSerialization (TopStateEx (Env (TopEnv (RecSubst defs) (CustomRules rules) cache _) _)) =
+  collectGarbage (RecSubstFrag defs) ruleFreeVars cache \defsFrag'@(RecSubstFrag defs') cache' -> do
+    let liveNames = toNameSet $ toScopeFrag defsFrag'
+    let rules' = unsafeCoerceE $ CustomRules $ M.filterWithKey (\k _ -> k `isInNameSet` liveNames) rules
+    TopStateEx $ Env (TopEnv (RecSubst defs') rules' cache' mempty) emptyModuleEnv
+  where
+    ruleFreeVars v = case M.lookup v rules of
+      Nothing -> mempty
+      Just r  -> freeVarsE r
 
 snapshotPtrs :: MonadIO m => TopStateEx -> m TopStateEx
 snapshotPtrs s = traverseBindingsTopStateEx s \case
@@ -596,6 +816,22 @@ traverseBindingsTopStateEx
 traverseBindingsTopStateEx (TopStateEx (Env tenv menv)) f = do
   defs <- traverseSubstFrag f $ fromRecSubst $ envDefs tenv
   return $ TopStateEx (Env (tenv {envDefs = RecSubst defs}) menv)
+
+abstractPtrLiterals
+  :: (EnvReader m, HoistableE e)
+  => e n -> m n (Abs (Nest IBinder) e n, [LitVal])
+abstractPtrLiterals block = do
+  let fvs = freeAtomVarsList block
+  (ptrNames, ptrVals) <- unzip <$> catMaybes <$> forM fvs \v ->
+    lookupAtomName v >>= \case
+      PtrLitBound _ name -> lookupEnv name >>= \case
+        PtrBinding (PtrLitVal ty ptr) ->
+          return $ Just ((v, LiftE (PtrType ty)), PtrLit $ PtrLitVal ty ptr)
+        PtrBinding (PtrSnapshot _ _) -> error "this case is only for serialization"
+      _ -> return Nothing
+  Abs nameBinders block' <- return $ abstractFreeVars ptrNames block
+  let ptrBinders = fmapNest (\(b:>LiftE ty) -> IBinder b ty) nameBinders
+  return (Abs ptrBinders block', ptrVals)
 
 -- -- === instances ===
 

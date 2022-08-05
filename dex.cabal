@@ -13,10 +13,11 @@ maintainer:          dougalm@google.com
 license-file:        LICENSE
 build-type:          Simple
 
-data-files:          lib/*.dx, static/*.html, static/*.js, static/*.css
-extra-source-files:  lib/*.dx,
-                     src/lib/dexrt.bc,
-                     static/index.js, static/style.css
+data-files:          lib/*.dx
+                   , static/*.css
+                   , static/*.html
+                   , static/*.js
+                   , src/lib/dexrt.bc
 
 flag cuda
   description:         Enables building with CUDA support
@@ -42,60 +43,165 @@ flag debug
   description:         Enable extra checks and stack trace printing (useful for developers)
   default:             False
 
-library dex-resources
-  if os(darwin)
-    exposed-modules:   Resources
-  build-depends:       base, bytestring, file-embed
-  hs-source-dirs:      src/resources
-  default-language:    Haskell2010
-  default-extensions:  CPP
-
 library
-  exposed-modules:     Syntax, Cat, Util, PPrint, Serialize
-                       TopLevel, Interpreter, Logging, CUDA,
-                       LLVM.JIT, LLVM.Shims, JIT, LLVMExec,
-                       Err, LabeledItems, SourceRename, Name, Parser, MTL1,
-                       Type, Builder, Inference, CheapReduction, GenericTraversal,
-                       Simplify, Imp, Algebra, Linearize, Transpose, Export,
-                       LLVM.HEAD.JIT
+  exposed-modules:     Algebra
+                     , Builder
+                     , CUDA
+                     , Cat
+                     , CheapReduction
+                     , CheckType
+                     , Core
+                     , Err
+                     , Export
+                     , GenericTraversal
+                     , Imp
+                     , Inference
+                     , Interpreter
+                     , JIT
+                     , LLVM.HEAD.JIT
+                     , LLVM.JIT
+                     , LLVM.Shims
+                     , LLVMExec
+                     , LabeledItems
+                     , Linearize
+                     , Logging
+                     , Lower
+                     , MTL1
+                     , Name
+                     , Optimize
+                     , PPrint
+                     , Parser
+                     , RawName
+                     , Serialize
+                     , Simplify
+                     , SourceRename
+                     , Syntax
+                     , TopLevel
+                     , Transpose
+                     , Types.Core
+                     , Types.Imp
+                     , Types.Primitives
+                     , Types.Source
+                     , QueryType
+                     , Util
   if flag(live)
-    exposed-modules:   Actor, RenderHtml, LiveOutput
+    exposed-modules:   Actor
+                     , Live.Eval
+                     , Live.Terminal
+                     , Live.Web
+                     , RenderHtml
   other-modules:       Paths_dex
-  build-depends:       base, containers, mtl, bytestring,
-                       llvm-hs-pure, llvm-hs, transformers, hashable, unordered-containers,
-                       exceptions, utf8-string, cryptonite,
+  build-depends:       base
+                     , bytestring
+                     , containers
+                     , cryptonite
+                     , exceptions
+                     , hashable
+                     , llvm-hs
+                     , llvm-hs-pure
+                     , mtl
+                     , scientific
+                     , transformers
+                     , unordered-containers
+                     , utf8-string
                        -- Parsing
-                       megaparsec, parser-combinators,
+                     , megaparsec
+                     , parser-combinators
                        -- Text output
-                       prettyprinter, text,
+                     , prettyprinter
+                     , text
                        -- Portable system utilities
-                       filepath, directory, ansi-terminal, process, temporary, haskeline,
+                     , ansi-terminal
+                     , directory
+                     , filepath
+                     , haskeline
+                     , process
+                     , temporary
                        -- Serialization
-                       store, aeson
+                     , aeson
+                     , store
   if flag(live)
-    build-depends:     warp, wai, blaze-html, http-types, cmark, binary
+    build-depends:     binary
+                     , blaze-html
+                     , cmark
+                     , http-types
+                     , wai
+                     , warp
     cpp-options:       -DDEX_LIVE
     cxx-options:       -DDEX_LIVE
   if flag(debug)
     cpp-options:       -DDEX_DEBUG
-  if !os(darwin)
-    exposed-modules:   Resources
-    hs-source-dirs:    src/resources
-    build-depends:     file-embed
-  else
-    build-depends:     dex-resources
   default-language:    Haskell2010
   hs-source-dirs:      src/lib
-  ghc-options:         -Wall -fPIC -optP-Wno-nonportable-include-path
+  ghc-options:         -Wall
                        -Wno-unticked-promoted-constructors
+                       -fPIC
+                       -optP-Wno-nonportable-include-path
   cxx-sources:         src/lib/dexrt.cpp
   cxx-options:         -std=c++11 -fPIC
-  default-extensions:  CPP, DeriveTraversable, TypeApplications, OverloadedStrings,
-                       TupleSections, ScopedTypeVariables, LambdaCase, PatternSynonyms,
-                       BlockArguments, GADTs, TypeOperators, DataKinds, KindSignatures
-                       ConstraintKinds, FlexibleContexts, RankNTypes, QuantifiedConstraints,
-                       TypeOperators, MultiParamTypeClasses, FunctionalDependencies,
-                       GeneralizedNewtypeDeriving
+                       -- Mimicking -XGHC2021 in GHC 8.10.1
+  default-extensions:  BangPatterns
+                     , BinaryLiterals
+                     , ConstrainedClassMethods
+                     , ConstraintKinds
+                     , DeriveDataTypeable
+                     , DeriveFoldable
+                     , DeriveFunctor
+                     , DeriveGeneric
+                     , DeriveLift
+                     , DeriveTraversable
+                     , DoAndIfThenElse
+                     , EmptyCase
+                     , EmptyDataDecls
+                     , EmptyDataDeriving
+                     , ExistentialQuantification
+                     , ExplicitForAll
+                     -- FieldSelectors was introduced in GHC 9.2
+                     , FlexibleContexts
+                     , FlexibleInstances
+                     , ForeignFunctionInterface
+                     , GADTSyntax
+                     , GeneralisedNewtypeDeriving
+                     , HexFloatLiterals
+                     , ImplicitPrelude
+                     , ImportQualifiedPost
+                     , InstanceSigs
+                     , KindSignatures
+                     , MonomorphismRestriction
+                     , MultiParamTypeClasses
+                     , NamedFieldPuns
+                     , NamedWildCards
+                     , NumericUnderscores
+                     , PatternGuards
+                     , PolyKinds
+                     , PostfixOperators
+                     , RankNTypes
+                     , RelaxedPolyRec
+                     , ScopedTypeVariables
+                     , StandaloneDeriving
+                     , StandaloneKindSignatures
+                     , StarIsType
+                     , TraditionalRecordSyntax
+                     , TupleSections
+                     , TypeApplications
+                     , TypeOperators
+                     , TypeSynonymInstances
+                     -- Other extensions
+                     , BlockArguments
+                     , CPP
+                     , DataKinds
+                     , DefaultSignatures
+                     , DerivingVia
+                     , FunctionalDependencies
+                     , GADTs
+                     , LambdaCase
+                     , OverloadedStrings
+                     , PatternSynonyms
+                     , QuantifiedConstraints
+                     , RecordWildCards
+                     , TypeFamilies
+                     , ViewPatterns
+
   pkgconfig-depends:   libpng
   if flag(cuda)
     include-dirs:      /usr/local/cuda/include
@@ -109,16 +215,31 @@ library
 
 executable dex
   main-is:             dex.hs
-  other-extensions:    OverloadedStrings
-  build-depends:       dex, base, containers, haskeline, prettyprinter, mtl,
-                       optparse-applicative, ansi-wl-pprint,
-                       unix, store, bytestring, directory, exceptions
-  if os(darwin)
-    build-depends:     dex-resources
+  build-depends:       dex
+                     , ansi-wl-pprint
+                     , base
+                     , bytestring
+                     , containers
+                     , directory
+                     , exceptions
+                     , haskeline
+                     , mtl
+                     , optparse-applicative
+                     , prettyprinter
+                     , store
+                     , text
+                     , unix
   default-language:    Haskell2010
   hs-source-dirs:      src
-  default-extensions:  CPP, LambdaCase, BlockArguments
-  ghc-options:         -threaded -optP-Wno-nonportable-include-path
+  ghc-options:         -threaded
+                       -optP-Wno-nonportable-include-path
+                       -rtsopts
+                       "-with-rtsopts=-I0 -A16m"
+  default-extensions:  CPP
+                     , DeriveGeneric
+                     , LambdaCase
+                     , OverloadedStrings
+                     , BlockArguments
   if flag(cuda)
     cpp-options:       -DDEX_CUDA
   if flag(live)
@@ -134,19 +255,113 @@ foreign-library Dex
   else
     buildable: False
   type:                native-shared
-  other-modules:       Dex.Foreign.API, Dex.Foreign.Util, Dex.Foreign.JIT
-                     , Dex.Foreign.Context, Dex.Foreign.Serialize
-  build-depends:       base, mtl, containers, llvm-hs, dex, random
-  if os(darwin)
-    build-depends:     dex-resources
+  other-modules:       Dex.Foreign.API
+                     , Dex.Foreign.Context
+                     , Dex.Foreign.JIT
+                     , Dex.Foreign.Serialize
+                     , Dex.Foreign.Util
+  build-depends:       dex
+                     , base
+                     , bytestring
+                     , containers
+                     , llvm-hs
+                     , mtl
+                     , random
+                     , text
   hs-source-dirs:      src/
   c-sources:           src/Dex/Foreign/rts.c
   cc-options:          -std=c11 -fPIC
-  ghc-options:         -Wall -fPIC -optP-Wno-nonportable-include-path
+  ghc-options:         -Wall
+                       -fPIC
+                       -optP-Wno-nonportable-include-path
   default-language:    Haskell2010
-  default-extensions:  TypeApplications, ScopedTypeVariables, LambdaCase,
-                       BlockArguments, DataKinds, GADTs
+  default-extensions:  BlockArguments
+                     , DataKinds
+                     , FlexibleInstances
+                     , GADTs
+                     , LambdaCase
+                     , OverloadedStrings
+                     , RecordWildCards
+                     , ScopedTypeVariables
+                     , ImportQualifiedPost
+                     , TypeApplications
   if flag(optimized)
     ghc-options:       -O3
   else
     ghc-options:       -O0
+
+test-suite spec
+  type:                exitcode-stdio-1.0
+  main-is:             Spec.hs
+  hs-source-dirs:      tests/unit
+  ghc-options:         -Wall
+  build-depends:       base
+                     , hspec
+                     , QuickCheck
+                     , dex
+  other-modules:       RawNameSpec
+  default-language:    Haskell2010
+  build-tool-depends:  hspec-discover:hspec-discover
+                       -- Mimicking -XGHC2021 in GHC 8.10.1
+  default-extensions:  BangPatterns
+                     , BinaryLiterals
+                     , ConstrainedClassMethods
+                     , ConstraintKinds
+                     , DeriveDataTypeable
+                     , DeriveFoldable
+                     , DeriveFunctor
+                     , DeriveGeneric
+                     , DeriveLift
+                     , DeriveTraversable
+                     , DoAndIfThenElse
+                     , EmptyCase
+                     , EmptyDataDecls
+                     , EmptyDataDeriving
+                     , ExistentialQuantification
+                     , ExplicitForAll
+                     -- FieldSelectors was introduced in GHC 9.2
+                     , FlexibleContexts
+                     , FlexibleInstances
+                     , ForeignFunctionInterface
+                     , GADTSyntax
+                     , GeneralisedNewtypeDeriving
+                     , HexFloatLiterals
+                     , ImplicitPrelude
+                     , ImportQualifiedPost
+                     , InstanceSigs
+                     , KindSignatures
+                     , MonomorphismRestriction
+                     , MultiParamTypeClasses
+                     , NamedFieldPuns
+                     , NamedWildCards
+                     , NumericUnderscores
+                     , PatternGuards
+                     , PolyKinds
+                     , PostfixOperators
+                     , RankNTypes
+                     , RelaxedPolyRec
+                     , ScopedTypeVariables
+                     , StandaloneDeriving
+                     , StandaloneKindSignatures
+                     , StarIsType
+                     , TraditionalRecordSyntax
+                     , TupleSections
+                     , TypeApplications
+                     , TypeOperators
+                     , TypeSynonymInstances
+                     -- Other extensions
+                     , BlockArguments
+                     , CPP
+                     , DataKinds
+                     , DefaultSignatures
+                     , DerivingVia
+                     , FunctionalDependencies
+                     , GADTs
+                     , LambdaCase
+                     , OverloadedStrings
+                     , PatternSynonyms
+                     , QuantifiedConstraints
+                     , RecordWildCards
+                     , TypeFamilies
+                     , ViewPatterns
+

@@ -4,8 +4,6 @@
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
-{-# LANGUAGE TypeFamilies #-}
-
 module Transpose (transpose) where
 
 import Data.Foldable
@@ -14,11 +12,11 @@ import Control.Monad.Reader
 import qualified Data.Set as S
 
 import MTL1
-import Type
 import Err
 import Name
 import Syntax
 import Builder
+import QueryType
 import Util (zipWithT, enumerate)
 import GHC.Stack
 
@@ -29,10 +27,11 @@ transpose lam = liftBuilder do
   let argTy = binderType b
   let resultTy' = ignoreHoistFailure $ hoist piBinder resultTy
   runReaderT1 (ListE []) $ runSubstReaderT idSubst $
-    buildLam "ct" LinArrow resultTy' Pure \ct ->
-      withAccumulator (sink argTy) \ref ->
-        extendSubst (b @> LinRef ref) $
+    buildLam noHint LinArrow resultTy' Pure \ct ->
+      withAccumulator (sink argTy) \refSubstVal ->
+        extendSubst (b @> refSubstVal) $
           transposeBlock body (sink $ Var ct)
+{-# SCC transpose #-}
 
 -- === transposition monad ===
 
@@ -48,6 +47,9 @@ type LinRegions = ListE AtomName
 type TransposeM a = SubstReaderT TransposeSubstVal
                       (ReaderT1 LinRegions BuilderM) a
 
+type TransposeM' a = SubstReaderT AtomSubstVal
+                       (ReaderT1 LinRegions BuilderM) a
+
 -- TODO: it might make sense to replace substNonlin/isLin
 -- with a single `trySubtNonlin :: e i -> Maybe (e o)`.
 -- But for that we need a way to traverse names, like a monadic
@@ -60,6 +62,22 @@ substNonlin e = do
                       RenameNonlin v' -> v'
                       _ -> error "not a nonlinear expression") e
 
+-- TODO: Can we generalize onNonLin to accept SubstReaderT Name instead of
+-- SubstReaderT AtomSubstVal?  For that to work, we need another combinator,
+-- that lifts a SubstReader AtomSubstVal into a SubstReader Name, because
+-- effectsSubstE is currently typed as SubstReader AtomSubstVal.
+-- Then we can presumably recode substNonlin as `onNonLin substM`.  We may
+-- be able to do that anyway, except we will then need to restrict the type
+-- of substNonlin to require `SubstE AtomSubstVal e`; but that may be fine.
+onNonLin :: HasCallStack
+         => TransposeM' i o a -> TransposeM i o a
+onNonLin cont = do
+  subst <- getSubst
+  let subst' = newSubst (\v -> case subst ! v of
+                                 RenameNonlin v' -> Rename v'
+                                 _ -> error "not a nonlinear expression")
+  liftSubstReaderT $ runSubstReaderT subst' cont
+
 isLin :: HoistableE e => e i -> TransposeM i o Bool
 isLin e = do
   substVals <- mapM lookupSubstM $ freeAtomVarsList e
@@ -71,12 +89,21 @@ isLin e = do
 withAccumulator
   :: Emits o
   => Type o
-  -> (forall o'. (Emits o', DExt o o') => Atom o' -> TransposeM i o' ())
+  -> (forall o'. (Emits o', DExt o o') => TransposeSubstVal AtomNameC o' -> TransposeM i o' ())
   -> TransposeM i o (Atom o)
 withAccumulator ty cont = do
-  baseMonoid <- getBaseMonoidType ty >>= tangentBaseMonoidFor
-  getSnd =<< emitRunWriter "ref" ty baseMonoid \_ ref ->
-               cont (Var ref) >> return UnitVal
+  singletonTypeVal ty >>= \case
+    Nothing -> do
+      baseMonoid <- tangentBaseMonoidFor =<< getBaseMonoidType ty
+      getSnd =<< emitRunWriter noHint ty baseMonoid \_ ref ->
+                   cont (LinRef $ Var ref) >> return UnitVal
+    Just val -> do
+      -- If the accumulator's type is inhabited by just one value, we
+      -- don't need any actual accumulation, and can just return that
+      -- value.  (We still run `cont` because it may emit decls that
+      -- have effects.)
+      Distinct <- getDistinct
+      cont LinTrivial >> return val
 
 emitCTToRef :: (Emits n, Builder m) => Atom n -> Atom n -> m n ()
 emitCTToRef ref ct = do
@@ -94,14 +121,14 @@ extendLinRegions v cont = local (\(ListE vs) -> ListE (v:vs)) cont
 transposeBlock :: Emits o => Block i -> Atom o -> TransposeM i o ()
 transposeBlock (Block _ decls result) ct = transposeWithDecls decls result ct
 
-transposeWithDecls :: Emits o => Nest Decl i i' -> Expr i' -> Atom o -> TransposeM i o ()
-transposeWithDecls Empty expr ct = transposeExpr expr ct
+transposeWithDecls :: Emits o => Nest Decl i i' -> Atom i' -> Atom o -> TransposeM i o ()
+transposeWithDecls Empty atom ct = transposeAtom atom ct
 transposeWithDecls (Nest (Let b (DeclBinding _ ty expr)) rest) result ct =
   substExprIfNonlin expr >>= \case
     Nothing  -> do
       ty' <- substNonlin ty
-      ctExpr <- withAccumulator ty' \ref ->
-                  extendSubst (b @> LinRef ref) $
+      ctExpr <- withAccumulator ty' \refSubstVal ->
+                  extendSubst (b @> refSubstVal) $
                     transposeWithDecls rest result (sink ct)
       transposeExpr expr ctExpr
     Just nonlinExpr -> do
@@ -114,10 +141,9 @@ substExprIfNonlin expr =
   isLin expr >>= \case
     True -> return Nothing
     False -> do
-      expr' <- substNonlin expr
-      exprEffects expr' >>= isLinEff >>= \case
+      onNonLin (getEffectsSubst expr) >>= isLinEff >>= \case
         True -> return Nothing
-        False -> return $ Just expr'
+        False -> Just <$> substNonlin expr
 
 isLinEff :: EffectRow o -> TransposeM i o Bool
 isLinEff effs@(EffectRow _ Nothing) = do
@@ -131,9 +157,8 @@ transposeExpr expr ct = case expr of
   Atom atom     -> transposeAtom atom ct
   -- TODO: Instead, should we handle table application like nonlinear
   -- expressions, where we just project the reference?
-  App x is -> do
-    -- TODO: we should check that it's a table type here, but it's awkward to do
-    -- because we need something in the o-space to do that.
+  App _ _ -> error "shouldn't have App left"
+  TabApp x is -> do
     is' <- mapM substNonlin is
     case x of
       Var v -> do
@@ -161,24 +186,25 @@ transposeExpr expr ct = case expr of
       False -> do
         e' <- substNonlin e
         void $ buildCase e' UnitTy \i vs -> do
+          vs' <- mapM emitAtomToName vs
           Abs bs body <- return $ alts !! i
-          extendSubst (bs @@> map RenameNonlin vs) do
+          extendSubst (bs @@> map RenameNonlin vs') do
             transposeBlock body (sink ct)
           return UnitVal
 
 transposeOp :: Emits o => Op i -> Atom o -> TransposeM i o ()
 transposeOp op ct = case op of
-  ScalarUnOp  FNeg x    -> transposeAtom x =<< neg ct
-  ScalarUnOp  _    _    -> notLinear
-  ScalarBinOp FAdd x y  -> transposeAtom x ct >> transposeAtom y ct
-  ScalarBinOp FSub x y  -> transposeAtom x ct >> (transposeAtom y =<< neg ct)
-  ScalarBinOp FMul x y  -> do
+  UnOp  FNeg x    -> transposeAtom x =<< neg ct
+  UnOp  _    _    -> notLinear
+  BinOp FAdd x y  -> transposeAtom x ct >> transposeAtom y ct
+  BinOp FSub x y  -> transposeAtom x ct >> (transposeAtom y =<< neg ct)
+  BinOp FMul x y  -> do
     xLin <- isLin x
     if xLin
       then transposeAtom x =<< mul ct =<< substNonlin y
       else transposeAtom y =<< mul ct =<< substNonlin x
-  ScalarBinOp FDiv x y  -> transposeAtom x =<< div' ct =<< substNonlin y
-  ScalarBinOp _    _ _  -> notLinear
+  BinOp FDiv x y  -> transposeAtom x =<< div' ct =<< substNonlin y
+  BinOp _    _ _  -> notLinear
   PrimEffect refArg m   -> do
     refArg' <- substNonlin refArg
     let emitEff = emitOp . PrimEffect refArg'
@@ -197,42 +223,44 @@ transposeOp op ct = case op of
         void $ emitEff $ MPut zero
   TabCon ty es -> do
     TabTy b _ <- return ty
-    idxTy <- substNonlin $ binderType b
+    idxTy <- substNonlin $ binderAnn b
     forM_ (enumerate es) \(ordinalIdx, e) -> do
-      i <- intToIndex idxTy (IdxRepVal $ fromIntegral ordinalIdx)
-      app ct i >>= transposeAtom e
+      i <- unsafeFromOrdinal idxTy (IdxRepVal $ fromIntegral ordinalIdx)
+      tabApp ct i >>= transposeAtom e
   IndexRef     _ _      -> notImplemented
   ProjRef      _ _      -> notImplemented
   Select       _ _ _    -> notImplemented
-  VectorBinOp  _ _ _    -> notImplemented
-  VectorPack   _        -> notImplemented
-  VectorIndex  _ _      -> notImplemented
   CastOp       _ _      -> notImplemented
-  RecordCons   _ _      -> notImplemented
-  RecordConsDynamic _ _ _ -> notImplemented
-  RecordSplitDynamic _ _  -> notImplemented
-  RecordSplit  _ _      -> notImplemented
-  VariantLift  _ _      -> notImplemented
-  VariantSplit _ _      -> notImplemented
+  RecordCons   _ _      -> unreachable
+  RecordConsDynamic _ _ _ -> unreachable
+  RecordSplitDynamic _ _  -> unreachable
+  RecordSplit  _ _      -> unreachable
+  VariantLift  _ _      -> unreachable
+  VariantSplit _ _      -> unreachable
   SumToVariant _        -> notImplemented
   PtrStore _ _          -> notLinear
   PtrLoad    _          -> notLinear
   PtrOffset _ _         -> notLinear
   IOAlloc _ _           -> notLinear
   IOFree _              -> notLinear
-  Inject       _        -> notLinear
-  SliceOffset  _ _      -> notLinear
-  SliceCurry   _ _      -> notLinear
-  UnsafeFromOrdinal _ _ -> notLinear
-  ToOrdinal    _        -> notLinear
-  IdxSetSize   _        -> notLinear
   ThrowError   _        -> notLinear
   DataConTag _          -> notLinear
   ToEnum _ _            -> notLinear
   ThrowException _      -> notLinear
   OutputStreamPtr       -> notLinear
-  SynthesizeDict _ _    -> notLinear
-  where notLinear = error $ "Can't transpose a non-linear operation: " ++ pprint op
+  ProjMethod _ _        -> unreachable
+  ExplicitApply _ _     -> unreachable
+  MonoLiteral _         -> unreachable
+  AllocDest _           -> unreachable
+  Place _ _             -> unreachable
+  Freeze _              -> unreachable
+  VectorBroadcast _ _   -> unreachable
+  VectorIota _          -> unreachable
+  VectorSubref _ _ _    -> unreachable
+  Resume _ _            -> notLinear
+  where
+    notLinear = error $ "Can't transpose a non-linear operation: " ++ pprint op
+    unreachable = error $ "Shouldn't appear in transposition: " ++ pprint op
 
 transposeAtom :: HasCallStack => Emits o => Atom i -> Atom o -> TransposeM i o ()
 transposeAtom atom ct = case atom of
@@ -249,23 +277,27 @@ transposeAtom atom ct = case atom of
   DataCon _ _ _ _ e -> void $ zipWithT transposeAtom e =<< getUnpacked ct
   Variant _ _ _ _ -> notImplemented
   TabVal b body   -> do
-    ty <- substNonlin $ binderType b
-    void $ buildFor "i" Fwd ty \i -> do
-      ct' <- app (sink ct) (Var i)
+    ty <- substNonlin $ binderAnn b
+    void $ buildFor noHint Fwd ty \i -> do
+      ct' <- tabApp (sink ct) (Var i)
       extendSubst (b@>RenameNonlin i) $ transposeBlock body ct'
       return UnitVal
   Lam _           -> notTangent
+  TabLam _        -> notTangent
+  DictCon _       -> notTangent
+  DictTy _        -> notTangent
   TypeCon _ _ _   -> notTangent
   LabeledRow _    -> notTangent
   RecordTy _      -> notTangent
   VariantTy _     -> notTangent
   Pi _            -> notTangent
+  TabPi _         -> notTangent
   DepPairTy _     -> notTangent
   TC _            -> notTangent
   Eff _           -> notTangent
   ACase _ _ _     -> error "Unexpected ACase"
   DataConRef _ _ _ -> error "Unexpected ref"
-  BoxedRef _ _     -> error "Unexpected ref"
+  BoxedRef _       -> error "Unexpected ref"
   DepPairRef _ _ _ -> error "Unexpected ref"
   ProjectElt idxs v -> do
     lookupSubstM v >>= \case
@@ -278,15 +310,15 @@ transposeAtom atom ct = case atom of
 
 transposeHof :: Emits o => Hof i -> Atom o -> TransposeM i o ()
 transposeHof hof ct = case hof of
-  For ann (Lam (LamExpr b  body)) -> do
-    ty <- substNonlin $ binderType b
-    void $ buildForAnn (getNameHint b) (flipDir ann) ty \i -> do
-      ctElt <- app (sink ct) (Var i)
+  For ann d (Lam (LamExpr b  body)) -> do
+    ixTy <- ixTyFromDict =<< substNonlin d
+    void $ buildForAnn (getNameHint b) (flipDir ann) ixTy \i -> do
+      ctElt <- tabApp (sink ct) (Var i)
       extendSubst (b@>RenameNonlin i) $ transposeBlock body ctElt
       return UnitVal
   RunState s (Lam (BinaryLamExpr hB refB body)) -> do
     (ctBody, ctState) <- fromPair ct
-    (_, cts) <- (fromPair =<<) $ emitRunState "s" ctState \h ref -> do
+    (_, cts) <- (fromPair =<<) $ emitRunState noHint ctState \h ref -> do
       extendSubst (hB@>RenameNonlin h) $ extendSubst (refB@>RenameNonlin ref) $
         extendLinRegions h $
           transposeBlock body (sink ctBody)
@@ -295,7 +327,7 @@ transposeHof hof ct = case hof of
   RunReader r (Lam (BinaryLamExpr hB refB body)) -> do
     accumTy <- getReferentTy =<< substNonlin (EmptyAbs $ PairB hB refB)
     baseMonoid <- getBaseMonoidType accumTy >>= tangentBaseMonoidFor
-    (_, ct') <- (fromPair =<<) $ emitRunWriter "w" accumTy baseMonoid \h ref -> do
+    (_, ct') <- (fromPair =<<) $ emitRunWriter noHint accumTy baseMonoid \h ref -> do
       extendSubst (hB@>RenameNonlin h) $ extendSubst (refB@>RenameNonlin ref) $
         extendLinRegions h $
           transposeBlock body (sink ct)
@@ -304,7 +336,7 @@ transposeHof hof ct = case hof of
   RunWriter _ (Lam (BinaryLamExpr hB refB body))-> do
     -- TODO: check we have the 0/+ monoid
     (ctBody, ctEff) <- fromPair ct
-    void $ emitRunReader "r" ctEff \h ref -> do
+    void $ emitRunReader noHint ctEff \h ref -> do
       extendSubst (hB@>RenameNonlin h) $ extendSubst (refB@>RenameNonlin ref) $
         extendLinRegions h $
           transposeBlock body (sink ctBody)
@@ -320,16 +352,14 @@ transposeCon con ct = case con of
       getProj i ct >>= transposeAtom x
   SumCon _ _ _      -> notImplemented
   SumAsProd _ _ _   -> notImplemented
-  ClassDictHole _ _ -> notTangent
-  IntRangeVal _ _ _     -> notTangent
-  IndexRangeVal _ _ _ _ -> notTangent
-  IndexSliceVal _ _ _   -> notTangent
-  ParIndexCon _ _       -> notTangent
+  FinVal _ _        -> notTangent
   LabelCon _     -> notTangent
   BaseTypeRef _  -> notTangent
   TabRef _       -> notTangent
   ConRef _       -> notTangent
   RecordRef _    -> notTangent
+  ExplicitDict _ _ -> notTangent
+  DictHole _ _ -> notTangent
   where notTangent = error $ "Not a tangent atom: " ++ pprint (Con con)
 
 notImplemented :: HasCallStack => a
@@ -337,9 +367,8 @@ notImplemented = error "Not implemented"
 
 flipDir :: ForAnn -> ForAnn
 flipDir ann = case ann of
-  RegularFor Fwd -> RegularFor Rev
-  RegularFor Rev -> RegularFor Fwd
-  ParallelFor -> ParallelFor
+  Fwd -> Rev
+  Rev -> Fwd
 
 -- === instances ===
 

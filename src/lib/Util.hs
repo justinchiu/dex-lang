@@ -4,22 +4,20 @@
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE MagicHash #-}
 
 module Util (IsBool (..), group, ungroup, pad, padLeft, delIdx, replaceIdx,
              insertIdx, mvIdx, mapFst, mapSnd, splitOn, scan,
-             scanM, composeN, mapMaybe, uncons, repeated,
+             scanM, composeN, mapMaybe, uncons, repeated, splitAtExact,
              transitiveClosure, transitiveClosureM,
-             showErr, listDiff, splitMap, enumerate, restructure,
+             showErr, listDiff, splitMap, enumerate, iota, restructure,
              onSnd, onFst, findReplace, swapAt, uncurry3,
-             measureSeconds,
-             bindM2, foldMapM, lookupWithIdx, (...), zipWithT, for,
+             measureSeconds, sameConstructor,
+             bindM2, foldMapM, lookupWithIdx, (...), zipWithT, for, getAlternative,
              Zippable (..), zipWithZ_, zipErr, forMZipped, forMZipped_,
-             iota, whenM, unsnoc, anyM,
-             File (..), FileHash, FileContents, addHash, readFileWithHash) where
+             whenM, unsnocNonempty, anyM,
+             File (..), FileHash, FileContents, addHash, readFileWithHash,
+             SnocList (..), snoc, unsnoc, toSnocList, emptySnocList) where
 
 import Crypto.Hash
 import Data.Functor.Identity (Identity(..))
@@ -31,16 +29,17 @@ import Data.List.NonEmpty (NonEmpty (..))
 import Prelude
 import qualified Data.Set as Set
 import qualified Data.Map.Strict as M
+import Control.Applicative
 import Control.Monad.State.Strict
 import System.CPUTime
-
-import Cat
+import GHC.Base (getTag)
+import GHC.Exts ((==#), tagToEnum#)
 
 class IsBool a where
   toBool :: a -> Bool
 
-iota :: Int -> [Int]
-iota n = [0..n-1]
+iota :: (Enum a, Integral a) => a -> [a]
+iota n = take (fromEnum n) [0..] -- XXX: `[0..(n-1)]` is incorrect for unsigned ints!
 
 swapAt :: Int -> a -> [a] -> [a]
 swapAt _ _ [] = error "swapping to empty list"
@@ -53,8 +52,8 @@ onFst f (x, y) = (f x, y)
 onSnd :: (a -> b) -> (c, a) -> (c, b)
 onSnd f (x, y) = (x, f y)
 
-unsnoc :: NonEmpty a -> ([a], a)
-unsnoc (x:|xs) = case reverse (x:xs) of
+unsnocNonempty :: NonEmpty a -> ([a], a)
+unsnocNonempty (x:|xs) = case reverse (x:xs) of
   (y:ys) -> (reverse ys, y)
   _ -> error "impossible"
 
@@ -97,6 +96,13 @@ pad v n xs = xs ++ replicate (n - length(xs)) v
 
 padLeft :: a -> Int -> [a] -> [a]
 padLeft v n xs = replicate (n - length(xs)) v ++ xs
+
+-- Nothing if the exact prefix isn't available
+splitAtExact :: Int -> [a] -> Maybe ([a], [a])
+splitAtExact n xs =
+  if n <= length xs
+    then Just $ splitAt n xs
+    else Nothing
 
 delIdx :: Int -> [a] -> [a]
 delIdx i xs = case splitAt i xs of
@@ -211,13 +217,13 @@ for = flip fmap
 
 transitiveClosure :: forall a. Ord a => (a -> [a]) -> [a] -> [a]
 transitiveClosure getParents seeds =
-  toList $ snd $ runCat (mapM_ go seeds) mempty
+  toList $ execState (mapM_ go seeds) mempty
   where
-    go :: a -> Cat (Set.Set a) ()
+    go :: a -> State (Set.Set a) ()
     go x = do
-      visited <- look
+      visited <- get
       unless (x `Set.member` visited) $ do
-        extend $ Set.singleton x
+        modify $ Set.insert x
         mapM_ go $ getParents x
 
 transitiveClosureM :: forall m a. (Monad m, Ord a) => (a -> m [a]) -> [a] -> m [a]
@@ -273,6 +279,41 @@ forMZipped xs ys f = zipWithZ f xs ys
 forMZipped_ :: Zippable f => MonadFail m => f a -> f b -> (a -> b -> m c) -> m ()
 forMZipped_ xs ys f = void $ forMZipped xs ys f
 
+getAlternative :: Alternative m => [a] -> m a
+getAlternative xs = asum $ map pure xs
+{-# INLINE getAlternative #-}
+
+newtype SnocList a = ReversedList { fromReversedList :: [a] }
+        deriving Functor -- XXX: NOT deriving order-sensitive things like Monoid, Applicative etc
+
+instance Semigroup (SnocList a) where
+  (ReversedList x) <> (ReversedList y) = ReversedList $ y ++ x
+  {-# INLINE (<>) #-}
+
+instance Monoid (SnocList a) where
+  mempty = ReversedList []
+  {-# INLINE mempty #-}
+
+instance Foldable SnocList where
+  foldMap f (ReversedList xs) = foldMap f (reverse xs)
+  {-# INLINE foldMap #-}
+
+snoc :: SnocList a -> a -> SnocList a
+snoc (ReversedList xs) x = ReversedList (x:xs)
+{-# INLINE snoc #-}
+
+emptySnocList :: SnocList a
+emptySnocList = ReversedList []
+{-# INLINE emptySnocList #-}
+
+unsnoc :: SnocList a -> [a]
+unsnoc (ReversedList x) = reverse x
+{-# INLINE unsnoc #-}
+
+toSnocList :: [a] -> SnocList a
+toSnocList xs = ReversedList $ reverse xs
+{-# INLINE toSnocList #-}
+
 -- === bytestrings paired with their hash digest ===
 
 -- TODO: use something other than a string to store the digest
@@ -291,3 +332,7 @@ addHash s = File s $ show (hash s :: Digest SHA256)
 
 readFileWithHash :: MonadIO m => FilePath -> m File
 readFileWithHash path = liftIO $ addHash <$> BS.readFile path
+
+sameConstructor :: a -> a -> Bool
+sameConstructor x y = tagToEnum# (getTag x ==# getTag y)
+{-# INLINE sameConstructor #-}

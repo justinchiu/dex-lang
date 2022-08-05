@@ -46,11 +46,13 @@ Scaling a quaternion is multiplying each of its components by a real number (the
 
 instance Add Quaternion
   add = \ x y. from_vec $ (as_vec x) + as_vec y
-  sub = \ x y. from_vec $ (as_vec x) - as_vec y
   zero = from_vec $ zero
 
+instance Sub Quaternion
+  sub = \ x y. from_vec $ (as_vec x) - as_vec y
+
 instance VSpace Quaternion
-  scaleVec = \ s x. from_vec (s .* as_vec x)
+  scale_vec = \ s x. from_vec (s .* as_vec x)
 
 
 ' ## Identity quaternion
@@ -79,10 +81,10 @@ $$
 
 instance Mul Quaternion
   mul = \ (Q{x,y,z,w}) (Q{x=x',y=y',z=z',w=w'}). Q {
-        x = w*x' + x*w' + y*z' - z*y',
-        y = w*y' - x*z' + y*w' + z*x',
-        z = w*z' + x*y' - y*x' + z*w',
-        w = w*w' - x*x' - y*y' - z*z'
+    x = w*x' + x*w' + y*z' - z*y',
+    y = w*y' - x*z' + y*w' + z*x',
+    z = w*z' + x*y' - y*x' + z*w',
+    w = w*w' - x*x' - y*y' - z*z'
   }
   one = ident
 

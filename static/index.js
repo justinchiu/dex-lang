@@ -44,6 +44,11 @@ function lookup_address(cell, address) {
 }
 
 function renderLaTeX() {
+    // Render LaTeX equations in prose blocks via KaTeX, if available.
+    // Skip rendering if KaTeX is unavailable.
+    if (typeof renderMathInElement == 'undefined') {
+        return;
+    }
     // Render LaTeX equations in prose blocks via KaTeX.
     var proseBlocks = document.querySelectorAll(".prose-block");
     Array.from(proseBlocks).map((proseBlock) =>

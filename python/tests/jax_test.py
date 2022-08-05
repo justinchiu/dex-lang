@@ -7,10 +7,12 @@
 import unittest
 import numpy as np
 from functools import partial
+from contextlib import contextmanager
 
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental import enable_x64
 
 import dex
 from dex.interop.jax import primitive, dexjit
@@ -30,7 +32,7 @@ class JAXTest(unittest.TestCase):
 
   def test_abstract_eval_simple(self):
     add_two = primitive(
-        dex.eval(r'\x:((Fin 10)=>Float). for i. FToI $ x.i + 2.0'))
+        dex.eval(r'\x:((Fin 10)=>Float). for i. f_to_i $ x.i + 2.0'))
     x = jax.ShapeDtypeStruct((10,), np.float32)
     output_shape = jax.eval_shape(add_two, x)
     assert output_shape.shape == (10,)
@@ -43,14 +45,14 @@ class JAXTest(unittest.TestCase):
 
   def test_jit_array(self):
     add_two = primitive(
-        dex.eval(r'\x:((Fin 10)=>Float). for i. FToI $ x.i + 2.0'))
+        dex.eval(r'\x:((Fin 10)=>Float). for i. f_to_i $ x.i + 2.0'))
     x = jnp.zeros((10,), dtype=np.float32)
     np.testing.assert_allclose(jax.jit(add_two)(x), (x + 2.0).astype(np.int32))
 
   def test_jit_scale(self):
     scale = primitive(dex.eval(r'\x:((Fin 10)=>Float) y:Float. for i. x.i * y'))
     x = jnp.arange(10, dtype=np.float32)
-    np.testing.assert_allclose(scale(x, 5.0), x * 5.0)
+    np.testing.assert_allclose(jax.jit(scale)(x, 5.0), x * 5.0)
 
   def test_vmap(self):
     add_two = primitive(dex.eval(r'\x:((Fin 2)=>Float). for i. x.i + 2.0'))
@@ -130,7 +132,7 @@ class JAXTest(unittest.TestCase):
   def test_grad(self):
     f_dex = primitive(dex.eval(
         r'\x:((Fin 10) => Float). '
-        'sum $ for i. (IToF $ ordinal i) * x.i * x.i'))
+        'sum $ for i. (n_to_f $ ordinal i) * x.i * x.i'))
 
     def f_jax(x):
       return jnp.sum(jnp.arange(10.) * x**2)
@@ -145,7 +147,7 @@ class JAXTest(unittest.TestCase):
   def test_grad_jit(self):
     f_dex = primitive(dex.eval(
         r'\x:((Fin 10) => Float). '
-        'sum $ for i. (IToF $ ordinal i) * x.i * x.i'))
+        'sum $ for i. (n_to_f $ ordinal i) * x.i * x.i'))
 
     def f_jax(x):
       return jnp.sum(jnp.arange(10.) * x**2)
@@ -212,15 +214,45 @@ def lax_test(prim, arg_thunk, **kwargs):
     f = dexjit(partial(prim, **kwargs))
     args = arg_thunk()
     np.testing.assert_allclose(f(*args), prim(*args, **kwargs), atol=1e-6, rtol=1e-6)
+    with enable_x64(), default_f64():
+      args = arg_thunk()
+      try:
+        y = f(*args)
+      except NotImplementedError:
+        # Not all ops have to support 64-bit floats
+        pass
+      else:
+        # ... but when they do, they better give good answers!
+        np.testing.assert_allclose(y, prim(*args, **kwargs))
   return test
 
+@contextmanager
+def default_f64():
+  global FP_DTYPE
+  old_dtype = FP_DTYPE
+  FP_DTYPE = np.dtype('float64')
+  try:
+    yield
+  finally:
+    FP_DTYPE = old_dtype
+
+FP_DTYPE = np.dtype('float32')
 def rn(*shape):
-  return np.random.default_rng(seed=1).normal(size=shape).astype(np.float32)
+  return np.random.default_rng(seed=1).normal(size=shape).astype(FP_DTYPE)
 
 class JAX2DexTest(unittest.TestCase):
   test_sin = lax_test(lax.sin, lambda: (rn(10, 10),))
   test_cos = lax_test(lax.cos, lambda: (rn(10, 10),))
   test_neg = lax_test(lax.neg, lambda: (rn(10, 10),))
+  test_neg_scalar = lax_test(lax.neg, lambda: (rn(),))
+  test_log = lax_test(lax.log, lambda: (rn(10, 10),))
+  test_exp = lax_test(lax.exp, lambda: (rn(10, 10),))
+  test_pow = lax_test(lax.pow, lambda: (rn(10), jnp.arange(10, dtype=FP_DTYPE)))
+  test_integer_pow = lax_test(lambda x: lax.integer_pow(x, 2), lambda: (rn(10, 10),))
+  test_scalar_select_lt = lax_test(lambda i, x, y: lax.select(i < 2.0, x, y),
+                                   lambda: (1.0, rn(10), rn(10)))
+  test_array_select_lt = lax_test(lambda i, x, y: lax.select(i < 0.0, x, y),
+                                  lambda: (rn(10), rn(10), rn(10)))
 
   test_squeeze_none = lax_test(lambda x: lax.squeeze(x, [ ]), lambda: (rn(10, 10),))
   test_squeeze_one = lax_test(lambda x: lax.squeeze(x, [1]), lambda: (rn(10, 1, 10),))
@@ -232,6 +264,8 @@ class JAX2DexTest(unittest.TestCase):
 
   test_concat_uniform = lax_test(partial(lax.concatenate, dimension=0),
                                  lambda: ([rn(4, 2) for _ in range(3)],))
+  test_concat_ragged = lax_test(partial(lax.concatenate, dimension=0),
+                                lambda: ([rn(1, 2, 4), rn(5, 2, 4), rn(2, 2, 4)],))
 
   test_dot_general_matmul = lax_test(partial(lax.dot_general, dimension_numbers=(((1,), (0,)), ((), ()))),
                                      lambda: (rn(4, 8), rn(8, 16)))
@@ -246,6 +280,26 @@ class JAX2DexTest(unittest.TestCase):
     jy = jax.jit(f)(x)
     np.testing.assert_allclose(dy, jy)
     self.assertEqual(dy.dtype, jy.dtype)
+
+  def test_64_bit(self):
+    def f(x):
+      return x * x + 4.0
+    x = np.float64(2.0)
+    with enable_x64():
+      np.testing.assert_allclose(dexjit(f)(x), 8.0)
+
+  def test_jit(self):
+    g = dexjit(lambda y: y * y)
+    f = jax.jit(lambda x: x * g(x))
+    x = jnp.arange(5)
+    np.testing.assert_allclose(f(x), x * x * x)
+
+  def test_jit_two_outputs(self):
+    f = jax.jit(dexjit(lambda x, y: (x + 1, y * 4)))
+    x = jnp.arange(10, dtype=np.float32)
+    y = 5.0
+    for l, r in zip(f(x, y), (x + 1, y * 4)):
+      np.testing.assert_allclose(l, r)
 
 
 def check_broadcasting_pointwise(prim, full=False):

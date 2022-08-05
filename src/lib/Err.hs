@@ -4,21 +4,16 @@
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE ConstraintKinds #-}
-
 module Err (Err (..), Errs (..), ErrType (..), Except (..), ErrCtx (..),
             SrcPosCtx, SrcTextCtx, SrcPos,
             Fallible (..), Catchable (..), catchErrExcept,
             FallibleM (..), HardFailM (..), CtxReader (..),
-            runFallibleM, runHardFail, throw, throwErr, throwIf,
+            runFallibleM, runHardFail, throw, throwErr,
             addContext, addSrcContext, addSrcTextContext,
-            catchIOExcept, liftExcept, liftMaybe, liftMaybeErr,
-            assertEq, ignoreExcept, isSuccess, exceptToMaybe,
-            pprint, docAsStr, asCompilerErr,
-            FallibleApplicativeWrapper, traverseMergingErrs, liftFallibleM,
+            catchIOExcept, liftExcept, liftExceptAlt,
+            assertEq, ignoreExcept,
+            pprint, docAsStr,
+            FallibleApplicativeWrapper, traverseMergingErrs,
             SearcherM (..), Searcher (..), runSearcherM) where
 
 import Control.Exception hiding (throw)
@@ -29,7 +24,9 @@ import Control.Monad.Identity
 import Control.Monad.Writer.Strict
 import Control.Monad.State.Strict
 import Control.Monad.Reader
-import Data.Text (unpack)
+import Data.Coerce
+import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Text.Prettyprint.Doc.Render.Text
 import Data.Text.Prettyprint.Doc
 import GHC.Stack
@@ -65,7 +62,7 @@ data ErrType = NoErr
                deriving (Show, Eq)
 
 type SrcPosCtx  = Maybe SrcPos
-type SrcTextCtx = Maybe (Int, String) -- Int is the offset in the source file
+type SrcTextCtx = Maybe (Int, Text) -- Int is the offset in the source file
 data ErrCtx = ErrCtx
   { srcTextCtx :: SrcTextCtx
   , srcPosCtx  :: SrcPosCtx
@@ -102,7 +99,9 @@ newtype FallibleM a =
 instance Fallible FallibleM where
   throwErrs (Errs errs) = FallibleM $ ReaderT \ambientCtx ->
     throwErrs $ Errs [Err errTy (ambientCtx <> ctx) s | Err errTy ctx s <- errs]
+  {-# INLINE throwErrs #-}
   addErrCtx ctx (FallibleM m) = FallibleM $ local (<> ctx) m
+  {-# INLINE addErrCtx #-}
 
 instance Catchable FallibleM where
   FallibleM m `catchErr` handler = FallibleM $ ReaderT \ctx ->
@@ -116,12 +115,15 @@ instance FallibleApplicative FallibleM where
 
 instance CtxReader FallibleM where
   getErrCtx = FallibleM ask
+  {-# INLINE getErrCtx #-}
 
 instance Fallible IO where
   throwErrs errs = throwIO errs
+  {-# INLINE throwErrs #-}
   addErrCtx ctx m = do
     result <- catchIOExcept m
     liftExcept $ addErrCtx ctx result
+  {-# INLINE addErrCtx #-}
 
 instance Catchable IO where
   catchErr cont handler =
@@ -137,6 +139,7 @@ instance FallibleApplicative IO where
 
 runFallibleM :: FallibleM a -> Except a
 runFallibleM m = runReaderT (fromFallibleM m) mempty
+{-# INLINE runFallibleM #-}
 
 -- === Except type ===
 
@@ -150,15 +153,20 @@ data Except a =
 
 instance Functor Except where
   fmap = liftM
+  {-# INLINE fmap #-}
 
 instance Applicative Except where
   pure = return
+  {-# INLINE pure #-}
   liftA2 = liftM2
+  {-# INLINE liftA2 #-}
 
 instance Monad Except where
   return = Success
+  {-# INLINE return #-}
   Failure errs >>= _ = Failure errs
   Success x >>= f = f x
+  {-# INLINE (>>=) #-}
 
 -- === FallibleApplicativeWrapper ===
 
@@ -172,8 +180,10 @@ newtype FallibleApplicativeWrapper m a =
 
 instance FallibleApplicative m => Applicative (FallibleApplicativeWrapper m) where
   pure x = FallibleApplicativeWrapper $ pure x
+  {-# INLINE pure #-}
   liftA2 f (FallibleApplicativeWrapper m1) (FallibleApplicativeWrapper m2) =
     FallibleApplicativeWrapper $ fmap (uncurry f) (mergeErrs m1 m2)
+  {-# INLINE liftA2 #-}
 
 -- === HardFail ===
 
@@ -181,17 +191,40 @@ instance FallibleApplicative m => Applicative (FallibleApplicativeWrapper m) whe
 -- work by trusting decl annotations and skipping the checks.
 newtype HardFailM a =
   HardFailM { runHardFail' :: Identity a }
-  deriving (Functor, Applicative, Monad)
+  -- We don't derive Functor, Applicative and Monad, because Identity doesn't
+  -- use INLINE pragmas in its own instances, which unnecessarily inhibits optimizations.
+
+instance Functor HardFailM where
+  fmap f (HardFailM (Identity x)) = HardFailM $ Identity $ f x
+  {-# INLINE fmap #-}
+
+instance Applicative HardFailM where
+  pure = HardFailM . Identity
+  {-# INLINE pure #-}
+  (<*>) = coerce
+  {-# INLINE (<*>) #-}
+  liftA2 = coerce
+  {-# INLINE liftA2 #-}
+
+instance Monad HardFailM where
+  (HardFailM (Identity x)) >>= k = k x
+  {-# INLINE (>>=) #-}
+  return = HardFailM . Identity
+  {-# INLINE return #-}
 
 runHardFail :: HardFailM a -> a
 runHardFail m = runIdentity $ runHardFail' m
+{-# INLINE runHardFail #-}
 
 instance MonadFail HardFailM where
   fail s = error s
+  {-# INLINE fail #-}
 
 instance Fallible HardFailM where
   throwErrs errs = error $ pprint errs
+  {-# INLINE throwErrs #-}
   addErrCtx _ cont = cont
+  {-# INLINE addErrCtx #-}
 
 instance FallibleApplicative HardFailM where
   mergeErrs cont1 cont2 = (,) <$> cont1 <*> cont2
@@ -200,65 +233,61 @@ instance FallibleApplicative HardFailM where
 
 throw :: Fallible m => ErrType -> String -> m a
 throw errTy s = throwErrs $ Errs [addCompilerStackCtx $ Err errTy mempty s]
+{-# INLINE throw #-}
 
 throwErr :: Fallible m => Err -> m a
 throwErr err = throwErrs $ Errs [addCompilerStackCtx err]
+{-# INLINE throwErr #-}
 
 addCompilerStackCtx :: Err -> Err
 addCompilerStackCtx (Err ty ctx msg) = Err ty ctx{stackCtx = compilerStack} msg
+  where
 #ifdef DEX_DEBUG
-  where compilerStack = Just $! reverse $ unsafePerformIO currentCallStack
+    compilerStack = case reverse (unsafePerformIO currentCallStack) of
+      []    -> Nothing
+      stack -> Just stack
 #else
-  where compilerStack = stackCtx ctx
+    compilerStack = stackCtx ctx
 #endif
-
-throwIf :: Fallible m => Bool -> ErrType -> String -> m ()
-throwIf True  e s = throw e s
-throwIf False _ _ = return ()
 
 addContext :: Fallible m => String -> m a -> m a
 addContext s m = addErrCtx (mempty {messageCtx = [s]}) m
+{-# INLINE addContext #-}
 
 addSrcContext :: Fallible m => SrcPosCtx -> m a -> m a
 addSrcContext ctx m = addErrCtx (mempty {srcPosCtx = ctx}) m
+{-# INLINE addSrcContext #-}
 
-addSrcTextContext :: Fallible m => Int -> String -> m a -> m a
+addSrcTextContext :: Fallible m => Int -> Text -> m a -> m a
 addSrcTextContext offset text m =
   addErrCtx (mempty {srcTextCtx = Just (offset, text)}) m
 
 catchIOExcept :: MonadIO m => IO a -> m (Except a)
 catchIOExcept m = liftIO $ (liftM Success m) `catches`
-  [ Handler \(e::Errs)          -> return $ Failure e
-  , Handler \(e::IOError)       -> return $ Failure $ Errs [Err DataIOErr   mempty $ show e]
-  , Handler \(e::SomeException) -> return $ Failure $ Errs [Err CompilerErr mempty $ show e]
+  [ Handler \(e::Errs)           -> return $ Failure e
+  , Handler \(e::IOError)        -> return $ Failure $ Errs [Err DataIOErr   mempty $ show e]
+  -- Propagate asynchronous exceptions like ThreadKilled; they are
+  -- part of normal operation (of the live evaluation modes), not
+  -- compiler bugs.
+  , Handler \(e::AsyncException) -> liftIO $ throwIO e
+  , Handler \(e::SomeException)  -> return $ Failure $ Errs [Err CompilerErr mempty $ show e]
   ]
-
-liftMaybe :: MonadFail m => Maybe a -> m a
-liftMaybe Nothing = fail ""
-liftMaybe (Just x) = return x
-
-liftMaybeErr :: Fallible m => ErrType -> String -> Maybe a -> m a
-liftMaybeErr err s Nothing  = throw err s
-liftMaybeErr _   _ (Just x) = return x
 
 liftExcept :: Fallible m => Except a -> m a
 liftExcept (Failure errs) = throwErrs errs
 liftExcept (Success ans) = return ans
+{-# INLINE liftExcept #-}
 
-liftFallibleM :: Fallible m => FallibleM a -> m a
-liftFallibleM m = liftExcept $ runFallibleM m
+liftExceptAlt :: Alternative m => Except a -> m a
+liftExceptAlt = \case
+  Success a -> pure a
+  Failure _ -> empty
+{-# INLINE liftExceptAlt #-}
 
 ignoreExcept :: HasCallStack => Except a -> a
 ignoreExcept (Failure e) = error $ pprint e
 ignoreExcept (Success x) = x
-
-isSuccess :: Except a -> Bool
-isSuccess (Success _) = True
-isSuccess (Failure _) = False
-
-exceptToMaybe :: Except a -> Maybe a
-exceptToMaybe (Success a) = Just a
-exceptToMaybe (Failure _) = Nothing
+{-# INLINE ignoreExcept #-}
 
 assertEq :: (HasCallStack, Fallible m, Show a, Pretty a, Eq a) => a -> a -> String -> m ()
 assertEq x y s = if x == y then return ()
@@ -266,11 +295,6 @@ assertEq x y s = if x == y then return ()
   where msg = "assertion failure (" ++ s ++ "):\n"
               ++ pprint x ++ " != " ++ pprint y ++ "\n\n"
               ++ prettyCallStack callStack ++ "\n"
-
--- TODO: think about the best way to handle these. This is just a
--- backwards-compatibility shim.
-asCompilerErr :: Fallible m => m a -> m a
-asCompilerErr cont = addContext "(This is a compiler error!)" cont
 
 -- === search monad ===
 
@@ -289,14 +313,18 @@ newtype SearcherM a = SearcherM { runSearcherM' :: MaybeT FallibleM a }
 
 runSearcherM :: SearcherM a -> Except (Maybe a)
 runSearcherM m = runFallibleM $ runMaybeT (runSearcherM' m)
+{-# INLINE runSearcherM #-}
 
 instance MonadFail SearcherM where
   fail _ = SearcherM $ MaybeT $ return Nothing
+  {-# INLINE fail #-}
 
 instance Fallible SearcherM where
   throwErrs e = SearcherM $ lift $ throwErrs e
+  {-# INLINE throwErrs #-}
   addErrCtx ctx (SearcherM (MaybeT m)) = SearcherM $ MaybeT $
     addErrCtx ctx $ m
+  {-# INLINE addErrCtx #-}
 
 instance Alternative SearcherM where
   empty = SearcherM $ MaybeT $ return Nothing
@@ -307,37 +335,52 @@ instance Alternative SearcherM where
 
 instance Searcher SearcherM where
   (<!>) = (<|>)
+  {-# INLINE (<!>) #-}
 
 instance CtxReader SearcherM where
   getErrCtx = SearcherM $ lift getErrCtx
+  {-# INLINE getErrCtx #-}
 
 instance Searcher [] where
   [] <!> m = m
   m  <!> _ = m
+  {-# INLINE (<!>) #-}
 
 instance (Monoid w, Searcher m) => Searcher (WriterT w m) where
   WriterT m1 <!> WriterT m2 = WriterT (m1 <!> m2)
+  {-# INLINE (<!>) #-}
 
 instance (Monoid w, Fallible m) => Fallible (WriterT w m) where
   throwErrs errs = lift $ throwErrs errs
+  {-# INLINE throwErrs #-}
   addErrCtx ctx (WriterT m) = WriterT $ addErrCtx ctx m
+  {-# INLINE addErrCtx #-}
+
+instance Searcher m => Searcher (ReaderT r m) where
+  ReaderT f1 <!> ReaderT f2 = ReaderT \r -> f1 r <!> f2 r
+  {-# INLINE (<!>) #-}
 
 instance Fallible [] where
   throwErrs _ = []
+  {-# INLINE throwErrs #-}
   addErrCtx _ m = m
+  {-# INLINE addErrCtx #-}
 
 instance Fallible Maybe where
   throwErrs _ = Nothing
+  {-# INLINE throwErrs #-}
   addErrCtx _ m = m
+  {-# INLINE addErrCtx #-}
 
 -- === small pretty-printing utils ===
 -- These are here instead of in PPrint.hs for import cycle reasons
 
 pprint :: Pretty a => a -> String
 pprint x = docAsStr $ pretty x
+{-# SCC pprint #-}
 
 docAsStr :: Doc ann -> String
-docAsStr doc = unpack $ renderStrict $ layoutPretty layout $ doc
+docAsStr doc = T.unpack $ renderStrict $ layoutPretty layout $ doc
 
 layout :: LayoutOptions
 layout = if unbounded then LayoutOptions Unbounded else defaultLayoutOptions
@@ -352,13 +395,16 @@ traverseMergingErrs f xs =
 
 instance MonadFail FallibleM where
   fail s = throw MonadFailErr s
+  {-# INLINE fail #-}
 
 instance Fallible Except where
   throwErrs errs = Failure errs
+  {-# INLINE throwErrs #-}
 
   addErrCtx _ (Success ans) = Success ans
   addErrCtx ctx (Failure (Errs errs)) =
     Failure $ Errs [Err errTy (ctx <> ctx') s | Err errTy ctx' s <- errs]
+  {-# INLINE addErrCtx #-}
 
 instance FallibleApplicative Except where
   mergeErrs (Success x) (Success y) = Success (x, y)
@@ -369,6 +415,7 @@ instance FallibleApplicative Except where
 
 instance MonadFail Except where
   fail s = Failure $ Errs [Err CompilerErr mempty s]
+  {-# INLINE fail #-}
 
 instance Exception Errs
 
@@ -433,7 +480,9 @@ instance Pretty ErrType where
 
 instance Fallible m => Fallible (ReaderT r m) where
   throwErrs errs = lift $ throwErrs errs
+  {-# INLINE throwErrs #-}
   addErrCtx ctx (ReaderT f) = ReaderT \r -> addErrCtx ctx $ f r
+  {-# INLINE addErrCtx #-}
 
 instance Catchable m => Catchable (ReaderT r m) where
   ReaderT f `catchErr` handler = ReaderT \r ->
@@ -445,6 +494,7 @@ instance FallibleApplicative m => FallibleApplicative (ReaderT r m) where
 
 instance CtxReader m => CtxReader (ReaderT r m) where
   getErrCtx = lift getErrCtx
+  {-# INLINE getErrCtx #-}
 
 instance Pretty Errs where
   pretty (Errs [err]) = pretty err
@@ -452,7 +502,9 @@ instance Pretty Errs where
 
 instance Fallible m => Fallible (StateT s m) where
   throwErrs errs = lift $ throwErrs errs
+  {-# INLINE throwErrs #-}
   addErrCtx ctx (StateT f) = StateT \s -> addErrCtx ctx $ f s
+  {-# INLINE addErrCtx #-}
 
 instance Catchable m => Catchable (StateT s m) where
   StateT f `catchErr` handler = StateT \s ->
@@ -460,6 +512,7 @@ instance Catchable m => Catchable (StateT s m) where
 
 instance CtxReader m => CtxReader (StateT s m) where
   getErrCtx = lift getErrCtx
+  {-# INLINE getErrCtx #-}
 
 instance Semigroup ErrCtx where
   ErrCtx text pos ctxStrs stk <> ErrCtx text' pos' ctxStrs' stk' =
@@ -482,25 +535,24 @@ rightmostJust = flip leftmostJust
 prettyLines :: (Foldable f, Pretty a) => f a -> Doc ann
 prettyLines xs = foldMap (\d -> pretty d <> hardline) xs
 
-highlightRegion :: (Int, Int) -> String -> String
+highlightRegion :: (Int, Int) -> Text -> Text
 highlightRegion pos@(low, high) s
-  | low > high || high > length s = error $ "Bad region: \n"
-                                              ++ show pos ++ "\n" ++ s
+  | low > high || high > T.length s =
+      error $ "Bad region: \n" ++ show pos ++ "\n" ++ T.unpack s
   | otherwise =
     -- TODO: flag to control line numbers
     -- (disabling for now because it makes quine tests tricky)
     -- "Line " ++ show (1 + lineNum) ++ "\n"
-
-    allLines !! lineNum ++ "\n"
-    ++ take start (repeat ' ') ++ take (stop - start) (repeat '^') ++ "\n"
+    allLines !! lineNum <> "\n" <>
+    T.replicate start " " <> T.replicate (stop - start) "^" <> "\n"
   where
-    allLines = lines s
+    allLines = T.lines s
     (lineNum, start, stop) = getPosTriple pos allLines
 
-getPosTriple :: (Int, Int) -> [String] -> (Int, Int, Int)
+getPosTriple :: (Int, Int) -> [Text] -> (Int, Int, Int)
 getPosTriple (start, stop) lines_ = (lineNum, start - offset, stop')
   where
-    lineLengths = map ((+1) . length) lines_
+    lineLengths = map ((+1) . T.length) lines_
     lineOffsets = cumsum lineLengths
     lineNum = maxLT lineOffsets start
     offset = lineOffsets  !! lineNum
@@ -513,4 +565,3 @@ maxLT :: Ord a => [a] -> a -> Int
 maxLT [] _ = 0
 maxLT (x:xs) n = if n < x then -1
                           else 1 + maxLT xs n
-

@@ -4,10 +4,6 @@
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 -- NOTE: Use LLVM.JIT instead of this version-specific module!
 module LLVM.HEAD.JIT where
 
@@ -94,8 +90,13 @@ compileModule moduleJIT@JIT{..} objFiles ast compilationPipeline = do
             _ -> []
       -- Sort in the order of decreasing priority!
       fmap snd $ sortBy (flip compare) $ flip fmap dtorStructs $
+#if MIN_VERSION_llvm_hs(15,0,0)
+        \(C.Struct _ _ [C.Int _ n, C.GlobalReference (LLVM.AST.Name dname), _]) ->
+#else
         \(C.Struct _ _ [C.Int _ n, C.GlobalReference _ (LLVM.AST.Name dname), _]) ->
+#endif
           (n, C8BS.unpack $ SBS.fromShort dname)
+{-# SCC compileModule #-}
 
 foreign import ccall "dynamic"
   callDtor :: FunPtr (IO ()) -> IO ()
@@ -105,6 +106,7 @@ unloadNativeModule :: NativeModule -> IO ()
 unloadNativeModule NativeModule{..} = do
   -- TODO: Clear the dylib
   forM_ moduleDtors callDtor
+{-# SCC unloadNativeModule #-}
 
 withNativeModule :: JIT -> [ObjectFileContents] -> LLVM.AST.Module -> CompilationPipeline -> (NativeModule -> IO a) -> IO a
 withNativeModule jit objs m p = bracket (compileModule jit objs m p) unloadNativeModule
@@ -112,9 +114,10 @@ withNativeModule jit objs m p = bracket (compileModule jit objs m p) unloadNativ
 getFunctionPtr :: NativeModule -> String -> IO (FunPtr a)
 getFunctionPtr NativeModule{..} funcName = do
   let JIT{..} = moduleJIT
-  Right (OrcJIT.JITSymbol funcAddr _) <-
-    OrcJIT.lookupSymbol session compileLayer moduleDylib (fromString funcName)
-  return $ castPtrToFunPtr $ wordPtrToPtr funcAddr
+  OrcJIT.lookupSymbol session compileLayer moduleDylib (fromString funcName) >>= \case
+    Right (OrcJIT.JITSymbol funcAddr _) ->
+      return $ castPtrToFunPtr $ wordPtrToPtr funcAddr
+    Left _ -> error $ "Couldn't find function: " ++ funcName
 
 newDylib :: JIT -> IO OrcJIT.JITDylib
 newDylib jit = do
@@ -129,3 +132,4 @@ loadObjectFile jit dylib objFileContents = do
     BS.hPut h objFileContents
     hFlush h
     OrcJIT.addObjectFile (objectLayer jit) dylib path
+{-# SCC loadObjectFile #-}

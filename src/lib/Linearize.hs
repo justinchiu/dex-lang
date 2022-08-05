@@ -4,8 +4,6 @@
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
-{-# LANGUAGE TypeFamilies #-}
-
 module Linearize (linearize) where
 
 import Control.Monad.Reader
@@ -18,10 +16,12 @@ import GHC.Stack
 import Name
 import Builder
 import Syntax
-import Type
 import MTL1
+import QueryType
 import Util (bindM2)
 import PPrint
+import Types.Core
+import Core
 
 -- === linearization monad ===
 
@@ -145,14 +145,16 @@ liftTangentM args m = liftSubstReaderT $ lift11 $ runReaderT1 args m
 
 isTrivialForAD :: Expr o -> PrimalM i o Bool
 isTrivialForAD expr = do
-  trivialTy  <- (maybeTangentType <$> getType expr) >>= \case
-    Nothing -> return False
-    Just tTy -> isSingletonType tTy
-  hasActiveEffs <- exprEffects expr >>= \case
+  trivialTy  <- presentAnd isSingletonType <$> (maybeTangentType =<< getType expr)
+  hasActiveEffs <- getEffects expr >>= \case
                      Pure -> return False
-                     _ -> return True -- TODO: be more precise here
+                     -- TODO: Be more precise here, such as checking
+                     -- whether the effects are themselves active.
+                     _ -> return True
   hasActiveVars <- isActive expr
   return $ not hasActiveEffs && (trivialTy || not hasActiveVars)
+    where presentAnd :: (a -> Bool) -> Maybe a -> Bool
+          presentAnd = any
 
 isActive :: HoistableE e => e o -> PrimalM i o Bool
 isActive e = do
@@ -229,6 +231,7 @@ linearize :: EnvReader m => Atom n -> m n (Atom n)
 linearize x = liftBuilder $
   runPrimalM idSubst emptyActivePrimals $
     linearizeLambda' x
+{-# SCC linearize #-}
 
 -- reify the tangent builder as a lambda
 linearizeLambda' :: Atom i -> PrimalM i o (Atom o)
@@ -250,8 +253,8 @@ linearizeAtom atom = case atom of
       Nothing -> withZeroT $ return (Var v')
       Just idx -> return $ WithTangent (Var v') $ getTangentArg idx
   Con con -> linearizePrimCon con
-  TabVal b body -> do
-    ty <- substM $ binderType b
+  TabLam (TabLamExpr b body) -> do
+    ty <- substM $ binderAnn b
     wrt <- getActivePrimals
     subst <- getSubst
     atom' <- substM atom
@@ -260,6 +263,8 @@ linearizeAtom atom = case atom of
         rematPrimal (sink subst) (sink wrt) $
           extendSubst (b@>i) $ linearizeBlock body
   DataCon _ _ _ _ _ -> notImplemented  -- Need to synthesize or look up a tangent ADT
+  DictCon _ -> notImplemented
+  DictTy _  -> notImplemented
   DepPair _ _ _     -> notImplemented
   Record elems ->
     fmapLin (Record . fromComposeE) $ seqLin (fmap linearizeAtom elems)
@@ -272,6 +277,7 @@ linearizeAtom atom = case atom of
   RecordTy _      -> emitZeroT
   VariantTy _     -> emitZeroT
   Pi _            -> emitZeroT
+  TabPi _         -> emitZeroT
   DepPairTy _     -> emitZeroT
   TC _            -> emitZeroT
   Eff _           -> emitZeroT
@@ -282,18 +288,18 @@ linearizeAtom atom = case atom of
   Lam _            -> error "Unexpected non-table lambda"
   ACase _ _ _      -> error "Unexpected ACase"
   DataConRef _ _ _ -> error "Unexpected ref"
-  BoxedRef _ _     -> error "Unexpected ref"
+  BoxedRef _       -> error "Unexpected ref"
   DepPairRef _ _ _ -> error "Unexpected ref"
   where emitZeroT = withZeroT $ substM atom
 
 linearizeBlock :: Emits o => Block i -> LinM i o Atom Atom
 linearizeBlock (Block _ decls result) =
-  linearizeDecls decls $ linearizeExpr result
+  linearizeDecls decls $ linearizeAtom result
 
 linearizeDecls :: Emits o => Nest Decl i i' -> LinM i' o e1 e2 -> LinM i  o e1 e2
 linearizeDecls Empty cont = cont
 -- TODO: as an optimization, don't bother extending the tangent args if the
--- tangent is trivial, either because its type is a singleton or because ther
+-- tangent is trivial, either because its type is a singleton or because there
 -- are no active vars.
 linearizeDecls (Nest (Let b (DeclBinding ann _ expr)) rest) cont = do
   expr' <- substM expr
@@ -315,12 +321,47 @@ linearizeDecls (Nest (Let b (DeclBinding ann _ expr)) rest) cont = do
 linearizeExpr :: Emits o => Expr i -> LinM i o Atom Atom
 linearizeExpr expr = case expr of
   Atom x -> linearizeAtom x
-  App x idxs -> do
-    substM x >>= getType >>= \case
-      TabTy _ _ ->
-        zipLin (linearizeAtom x) (pureLin $ ListE $ toList idxs) `bindLin`
-         \(PairE x' (ListE idxs')) -> naryApp x' idxs'
-      _ -> error "not implemented"
+  App (Var f) xs -> do
+    f' <- substM f
+    lookupCustomRules f' >>= \case
+      Nothing -> error "not implemented"
+      Just (CustomLinearize n zeros cl) -> do
+        let (polyXs, argXs) = splitAt n $ toList xs
+        polyXs' <- mapM substM polyXs
+        (any id <$> mapM isActive polyXs') >>= \case
+          True -> error $
+            "Polymorphic arguments of custom linearization rules are " ++
+            "expected to be inactive (i.e. independent of any differentiated " ++
+            "function argument)"
+          False -> return ()
+        wts <- case zeros of
+          InstantiateZeros -> forM (toList argXs) linearizeAtom
+          SymbolicZeros -> do
+            stDefName <- lookupSourceMap "ZeroTangent" >>= \case
+              Just (UDataConVar conName) -> do
+                DataConBinding dataDefName zeroConIx _ <- lookupEnv conName
+                unless (zeroConIx == 0) $ error "Ill-defined SymbolicTangent?"
+                return dataDefName
+              _ -> error "Ill-defined SymbolicTangent?"
+            forM (toList argXs) \arg -> do
+              arg' <- substM arg
+              argTy' <- getType arg'
+              isActive arg' >>= \case
+                False -> -- Pass in ZeroTangent as the tangent
+                  return $ WithTangent arg' $
+                    return $ sink $ DataCon "SymbolicTangent" stDefName
+                                    (DataDefParams [argTy'] []) 0 []
+                True -> do  -- Wrap tangent in SomeTangent
+                  WithTangent arg'' argLin <- dropSubst $ linearizeAtom arg'
+                  return $ WithTangent arg'' $ argLin <&> \argTan ->
+                    DataCon "SymbolicTangent" (sink stDefName)
+                    (DataDefParams [sink argTy'] []) 1 [argTan]
+        (ans, flin) <- fromPair =<< naryApp cl (polyXs' ++ (wts <&> \(WithTangent p _) -> p))
+        return $ WithTangent ans $ naryApp (sink flin) =<< sequence (wts <&> \(WithTangent _ t) -> t)
+  App _ _ -> error "not implemented"
+  TabApp x idxs -> do
+    zipLin (linearizeAtom x) (pureLin $ ListE $ toList idxs) `bindLin`
+      \(PairE x' (ListE idxs')) -> naryTabApp x' idxs'
   Op op      -> linearizeOp op
   Hof e      -> linearizeHof e
   Case e alts resultTy _ -> do
@@ -329,18 +370,20 @@ linearizeExpr expr = case expr of
     isActive e' >>= \case
       True -> notImplemented
       False -> do
+        resultTangentType <- tangentType resultTy'
         resultTyWithTangent <- PairTy <$> substM resultTy
-                                      <*> tangentFunType (tangentType resultTy')
+                                      <*> tangentFunType resultTangentType
         (ans, linLam) <- fromPair =<< buildCase e' resultTyWithTangent \i xs -> do
+          xs' <- mapM emitAtomToName xs
           Abs bs body <- return $ alts !! i
-          extendSubst (bs@@>xs) $ withTangentFunAsLambda $ linearizeBlock body
+          extendSubst (bs @@> xs') $ withTangentFunAsLambda $ linearizeBlock body
         return $ WithTangent ans do
           applyLinToTangents $ sink linLam
 
 linearizeOp :: Emits o => Op i -> LinM i o Atom Atom
 linearizeOp op = case op of
-  ScalarUnOp  uop x       -> linearizeUnOp  uop x
-  ScalarBinOp bop x y     -> linearizeBinOp bop x y
+  UnOp  uop x       -> linearizeUnOp  uop x
+  BinOp bop x y     -> linearizeBinOp bop x y
   PrimEffect ref m -> case m of
     MAsk -> linearizeAtom ref `bindLin` \ref' -> emitOp $ PrimEffect ref' MAsk
     MExtend monoid x -> do
@@ -362,15 +405,6 @@ linearizeOp op = case op of
   PtrOffset _ _          -> emitZeroT
   IOAlloc _ _            -> emitZeroT
   IOFree _               -> emitZeroT
-  Inject _               -> emitZeroT
-  SliceOffset _ _        -> emitZeroT
-  SliceCurry  _ _        -> emitZeroT
-  VectorBinOp _ _ _      -> notImplemented
-  VectorIndex v i -> zipLin (la v) (pureLin i) `bindLin`
-                       \(PairE v' i') -> emitOp $ VectorIndex v' i'
-  UnsafeFromOrdinal _ _  -> emitZeroT
-  ToOrdinal _            -> emitZeroT
-  IdxSetSize _           -> emitZeroT
   ThrowError _           -> emitZeroT
   DataConTag _           -> emitZeroT
   ToEnum _ _             -> emitZeroT
@@ -378,19 +412,18 @@ linearizeOp op = case op of
     ty' <- substM ty
     seqLin (map linearizeAtom xs) `bindLin` \(ComposeE xs') ->
       emitOp $ TabCon (sink ty') xs'
-  VectorPack xs ->
-    seqLin (map linearizeAtom xs) `bindLin` \(ComposeE xs') ->
-      emitOp $ VectorPack xs'
   CastOp t v             -> do
     vt <- getType =<< substM v
     t' <- substM t
-    ((&&) <$> (tangentType vt `alphaEq` vt)
-          <*> (tangentType t' `alphaEq` t')) >>= \case
+    vtTangentType <- tangentType vt
+    tTangentType  <- tangentType t'
+    ((&&) <$> (vtTangentType `alphaEq` vt)
+          <*> (tTangentType  `alphaEq` t')) >>= \case
       True -> do
         linearizeAtom v `bindLin` \v' -> emitOp $ CastOp (sink t') v'
       False -> do
         WithTangent x xt <- linearizeAtom v
-        yt <- case (tangentType vt, tangentType t') of
+        yt <- case (vtTangentType, tTangentType) of
           (_     , UnitTy) -> return $ UnitVal
           (UnitTy, tt    ) -> zeroAt tt
           _                -> error "Expected at least one side of the CastOp to have a trivial tangent type"
@@ -419,7 +452,7 @@ linearizeOp op = case op of
 linearizeUnOp :: Emits o => UnOp -> Atom i -> LinM i o Atom Atom
 linearizeUnOp op x' = do
   WithTangent x tx <- linearizeAtom x'
-  let emitZeroT = withZeroT $ emitOp $ ScalarUnOp op x
+  let emitZeroT = withZeroT $ emitOp $ UnOp op x
   case op of
     Exp    -> do
       y <- emitUnOp Exp x
@@ -448,7 +481,7 @@ linearizeBinOp :: Emits o => BinOp -> Atom i -> Atom i -> LinM i o Atom Atom
 linearizeBinOp op x' y' = do
   WithTangent x tx <- linearizeAtom x'
   WithTangent y ty <- linearizeAtom y'
-  let emitZeroT = withZeroT $ emitOp $ ScalarBinOp op x y
+  let emitZeroT = withZeroT $ emitOp $ BinOp op x y
   case op of
     IAdd   -> emitZeroT
     ISub   -> emitZeroT
@@ -466,7 +499,7 @@ linearizeBinOp op x' y' = do
       ty' <- bindM2 div' (bindM2 mul (sinkM x) ty)
                       (bindM2 mul (sinkM y) (sinkM y))
       sub tx' ty'
-    FPow -> withT (emitOp $ ScalarBinOp FPow x y) do
+    FPow -> withT (emitOp $ BinOp FPow x y) do
       c <- fpow (sink x) =<< bindM2 sub (sinkM y) (1.0 `fLitLike` sink y)
       tx' <- bindM2 mul tx (sinkM y)
       ty' <- bindM2 mul (bindM2 mul (sinkM x) ty) (flog $ sink x)
@@ -493,28 +526,26 @@ linearizePrimCon con = case con of
       elemsT <- forM elemsWithT \elemsWithT' ->
                   forM elemsWithT' \(WithTangent _ t) -> t
       return $ Con $ SumAsProd (sink ty') (sink tg') elemsT
-  IntRangeVal _ _ _     -> emitZeroT
-  IndexRangeVal _ _ _ _ -> emitZeroT
-  IndexSliceVal _ _ _   -> emitZeroT
+  FinVal _ _            -> emitZeroT
   LabelCon _     -> error "Unexpected label"
   BaseTypeRef _  -> error "Unexpected ref"
   TabRef _       -> error "Unexpected ref"
   ConRef _       -> error "Unexpected ref"
   RecordRef _    -> error "Unexpected ref"
-  ParIndexCon   _ _ -> error "Unexpected ParIndexCon"
-  ClassDictHole _ _ -> error "Unexpected ClassDictHole"
+  ExplicitDict  _ _ -> error "Unexpected ExplicitDict"
+  DictHole _ _ -> error "Unexpected DictHole"
   where emitZeroT = withZeroT $ substM $ Con con
 
 linearizeHof :: Emits o => Hof i -> LinM i o Atom Atom
 linearizeHof hof = case hof of
-  For (RegularFor d) (Lam (LamExpr (LamBinder i ty _ _) body)) -> do
-    ty' <- substM ty
-    ansWithLinTab <- buildFor (getNameHint i) d ty' \i' ->
+  For d ixDict (Lam (LamExpr i body)) -> do
+    ixTy <- ixTyFromDict =<< substM ixDict
+    ansWithLinTab <- buildFor (getNameHint i) d ixTy \i' ->
       extendSubst (i@>i') $ withTangentFunAsLambda $ linearizeBlock body
     (ans, linTab) <- unzipTab ansWithLinTab
     return $ WithTangent ans do
-      buildFor (getNameHint i) d (sink ty') \i' ->
-        app (sink linTab) (Var i') >>= applyLinToTangents
+      buildFor (getNameHint i) d (sink ixTy) \i' ->
+        tabApp (sink linTab) (Var i') >>= applyLinToTangents
   RunReader r lam -> do
     WithTangent r' rLin <- linearizeAtom r
     lam' <- linearizeEffectFun Reader lam
@@ -546,7 +577,7 @@ linearizeHof hof = case hof of
   RunIO (Lam (LamExpr b@(LamBinder _ _ _ effs) body)) -> do
     effs' <- substM $ ignoreHoistFailure $ hoist b effs
     -- TODO: consider the possibility of other effects here besides IO
-    ioLam <- buildLam "_" PlainArrow UnitTy effs' \v -> do
+    ioLam <- buildLam noHint PlainArrow UnitTy effs' \v -> do
       WithTangent primalResult tangentFun <- extendSubst (b@>v) $ linearizeBlock body
       lam <- tangentFunAsLambda tangentFun
       return $ PairVal primalResult lam
@@ -567,7 +598,8 @@ linearizeEffectFun rws ~(Lam lam) = do
       extendActiveEffs (RWSEffect rws (Just h)) do
         WithTangent p tangentFun <- linearizeBlock body
         return $ WithTangent p do
-          buildEffLam rws (getNameHint refB) (tangentType $ sink referentTy) \h' ref' ->
+          tt <- tangentType $ sink referentTy
+          buildEffLam rws (getNameHint refB) tt \h' ref' ->
             extendTangentArgs h' $ extendTangentArgs ref' $
               tangentFun
 
@@ -584,7 +616,7 @@ withZeroT p = do
   p' <- p
   return $ WithTangent p' do
     pTy <- getType $ sink p'
-    zeroAt $ tangentType pTy
+    zeroAt =<< tangentType pTy
 
 notImplemented :: HasCallStack => a
 notImplemented = error "Not implemented"
@@ -594,7 +626,9 @@ notImplemented = error "Not implemented"
 instance GenericE ActivePrimals where
   type RepE ActivePrimals = PairE (ListE AtomName) EffectRow
   fromE (ActivePrimals vs effs) = ListE vs `PairE` effs
+  {-# INLINE fromE #-}
   toE   (ListE vs `PairE` effs) = ActivePrimals vs effs
+  {-# INLINE toE #-}
 
 instance SinkableE   ActivePrimals
 instance HoistableE  ActivePrimals
@@ -604,7 +638,9 @@ instance SubstE Name ActivePrimals
 instance GenericE TangentArgs where
   type RepE TangentArgs = ListE AtomName
   fromE (TangentArgs vs) = ListE vs
+  {-# INLINE fromE #-}
   toE   (ListE vs) = TangentArgs vs
+  {-# INLINE toE #-}
 
 instance SinkableE   TangentArgs
 instance HoistableE  TangentArgs

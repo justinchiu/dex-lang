@@ -4,9 +4,6 @@
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module Dex.Foreign.Context (
   Context (..), AtomEx (..),
   setError,
@@ -21,10 +18,11 @@ import Foreign.C.String
 import System.Random
 
 import Control.Monad.IO.Class
-import Data.String
 import Data.Functor
 import Data.Foldable
-import qualified Data.Map.Strict as M
+import Data.Map.Strict    qualified as M
+import Data.ByteString    qualified as BS
+import Data.Text.Encoding qualified as T
 
 import Syntax  hiding (sizeOf)
 import TopLevel
@@ -43,10 +41,10 @@ data AtomEx where
 
 dexCreateContext :: IO (Ptr Context)
 dexCreateContext = do
-  let evalConfig = EvalConfig LLVM Nothing Nothing Nothing
+  let evalConfig = EvalConfig LLVM [LibBuiltinPath] Nothing Nothing Nothing Optimize
   cachedEnv <- loadCache
   runTopperM evalConfig cachedEnv (evalSourceBlockRepl preludeImportBlock) >>= \case
-    (Result [] (Success  ()), preludeEnv) -> toStablePtr $ Context evalConfig preludeEnv
+    (Result _  (Success  ()), preludeEnv) -> toStablePtr $ Context evalConfig preludeEnv
     (Result _  (Failure err), _         ) -> nullPtr <$
       setError ("Failed to initialize standard library: " ++ pprint err)
 
@@ -59,8 +57,8 @@ dexForkContext ctxPtr = toStablePtr =<< fromStablePtr ctxPtr
 dexEval :: Ptr Context -> CString -> IO (Ptr Context)
 dexEval ctxPtr sourcePtr = do
   Context evalConfig initEnv <- fromStablePtr ctxPtr
-  source <- peekCString sourcePtr
-  (results, finalEnv) <- runTopperM evalConfig initEnv $ evalSourceText source
+  source <- T.decodeUtf8 <$> BS.packCString sourcePtr
+  (results, finalEnv) <- runTopperM evalConfig initEnv $ evalSourceText source (const $ return ()) (const $ return True)
   let anyError = asum $ fmap (\case (_, Result _ (Failure err)) -> Just err; _ -> Nothing) results
   case anyError of
     Nothing  -> toStablePtr $ Context evalConfig finalEnv
@@ -73,7 +71,7 @@ dexInsert ctxPtr namePtr atomPtr = do
   AtomEx atom <- fromStablePtr atomPtr
   (_, finalEnv) <- runTopperM evalConfig initEnv do
     -- TODO: Check if atom is compatible with context! Use module name?
-    name <- emitTopLet (fromString sourceName) PlainLet $ Atom $ unsafeCoerceE atom
+    name <- emitTopLet (getNameHint @String sourceName) PlainLet $ Atom $ unsafeCoerceE atom
     emitSourceMap $ SourceMap $ M.singleton sourceName [ModuleVar Main $ Just $ UAtomVar name]
   toStablePtr $ Context evalConfig finalEnv
 

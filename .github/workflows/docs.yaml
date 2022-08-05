@@ -13,19 +13,12 @@ jobs:
         os: [ubuntu-20.04]
         include:
           - os: ubuntu-20.04
-            install_deps: sudo apt-get install llvm-12-tools llvm-12-dev pkg-config
+            install_deps: sudo apt-get install llvm-12-tools llvm-12-dev pkg-config wamerican
             path_extension: /usr/lib/llvm-12/bin
 
     steps:
     - name: Checkout the repository
       uses: actions/checkout@v2
-
-    - name: Setup Haskell Stack
-      uses: actions/setup-haskell@v1
-      with:
-        enable-stack: true
-        stack-no-global: true
-        stack-version: 'latest'
 
     - name: Install system dependencies
       run: |
@@ -59,6 +52,6 @@ jobs:
       with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: gh-pages # The branch the action should deploy to.
-          folder: doc      # The folder the action should deploy.
+          folder: pages    # The folder the action should deploy.
           clean: false     # If true, automatically remove deleted files from the deploy branch.
           commit-message: Updating gh-pages from ${{ github.sha }}

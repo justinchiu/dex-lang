@@ -88,13 +88,13 @@ myPair = (1, 2.3)
 > 1
 
 :p
-   yieldState 2 \s.
+   yield_state 2 \s.
      x = get s
      s := x + 3
 > 5
 
 :p
-   yieldState 1 \s.
+   yield_state 1 \s.
      for i:(Fin 10).
        x = get s
        s := x + x
@@ -118,10 +118,10 @@ myPair = (1, 2.3)
   x
 > [1, 2, 3, 4]@(Fin 2 & Fin 2)
 
-:p [] : (Fin 0 => Int)
+:p [] :: (Fin 0 => Int)
 > []
 
-:p [1, 2, 3, 4] : ((Fin 2 & Fin 2) => Int)
+:p [1, 2, 3, 4] :: ((Fin 2 & Fin 2) => Int)
 > [1, 2, 3, 4]@(Fin 2 & Fin 2)
 
 
@@ -170,7 +170,7 @@ myPair = (1, 2.3)
 -- >    ^^^
 
 :p
-  yieldState [1,2,3] \xsRef.
+  yield_state [1,2,3] \xsRef.
     for i:(Fin 3).
       xsRef!i := ordinal i
 > [0, 1, 2]
@@ -178,13 +178,13 @@ myPair = (1, 2.3)
 def passthrough {a b} {eff:Effects} (f:(a -> {|eff} b)) (x:a) : {|eff} b = f x
 
 :p
-  yieldState 1 \ref.
+  yield_state 1 \ref.
     passthrough (\(). ref := 10) ()
 > 10
 
 :p
-  runState 0 \r1.
-    runState 0 \r2.
+  run_state 0 \r1.
+    run_state 0 \r2.
       r1 := 1
       r2 := 2
 > (((), 2), 1)
@@ -227,26 +227,26 @@ def myOtherFst {a b} ((x, _):(a&b)) : a = x
 :p
    f : Float --o Float =
      \x. 2.0 * (x + x)
-   transposeLinear f 1.0
+   transpose_linear f 1.0
 > 4.
 
 -- FIXME: This fails due to shadowing!
 --def transpose' (x:n=>m=>Float) --o : m=>n=>Float = for i j. x.j.i
 --
---:p transposeLinear transpose' [[1.0, 2.0, 3.0]]
+--:p transpose_linear transpose' [[1.0, 2.0, 3.0]]
 --> [[1.0], [2.0], [3.0]]
 
 :p
    f : Float --o (Fin 3=>Float) =
      \x. for i. x * 2.0
-   transposeLinear f [1.0, 2.0, 3.0]
+   transpose_linear f [1.0, 2.0, 3.0]
 > 12.
 
 id'' : b:Type ?-> b -> b = id
 
 def eitherFloor (x:(Int|Float)) : Int = case x of
   Left  i -> i
-  Right f -> FToI f
+  Right f -> f_to_i f
 
 :p (eitherFloor (Left 1), eitherFloor (Right 2.3))
 > (1, 2)
@@ -285,20 +285,19 @@ def eitherFloor (x:(Int|Float)) : Int = case x of
 
 -- Can only unpack tables indexed by `Fin n`
 :p
-  [a, b, c, d] = [1, 2, 3, 4] : ((Fin 2 & Fin 2) => Int)
+  [a, b, c, d] = [1, 2, 3, 4] :: ((Fin 2 & Fin 2) => Int)
   (a, b, c, d)
 > Type error:
 > Expected: ((Fin 2 & Fin 2) => Int32)
 >   Actual: ((Fin 4) => a)
 > (Solving for: [a])
 >
->   [a, b, c, d] = [1, 2, 3, 4] : ((Fin 2 & Fin 2) => Int)
+>   [a, b, c, d] = [1, 2, 3, 4] :: ((Fin 2 & Fin 2) => Int)
 >   ^^^^^^^^^^^^^
 
 -- Needs delayed inference (can't verify Ix and reduce the type before we infer the hole).
 -- :p
---   -- parentheses needed to stop the parser from reading "zero" as a binder name
---   [a, b, c, d] = (zero) : (_ => Int)
+--   [a, b, c, d] = zero :: (_ => Int)
 --   (a, b, c, d)
 -- > (0, (0, (0, 0)))
 
@@ -307,7 +306,14 @@ def bug (n : Type) : Unit =
     w : n = todo
     for i:(w..). ()
   ()
-> Leaked local variables:[v]
+> Leaked local variables:[v#0]
+> Block:
+>  v#0:n = todo n
+>  w:n = v#0
+>  v#1:((v#0..) => Unit) = for i:(v#0..). ()
+>  v#1
+> Of type: ((v#0..) => Unit)
+> With effects: {}
 >
 >   for w':n.
 >   ^^^^
