@@ -12,6 +12,7 @@ test-script.cd
 .stack-work-dbg
 .stack-work-prof
 .stack-work-test
+.stack-work-test-dbg
 .stack-work-ffis
 garbage.hs
 *.lock
@@ -35,3 +36,4 @@ Manifest.toml
 julia/deps/build.log
 examples/t10k-images-idx3-ubyte
 examples/t10k-labels-idx1-ubyte
+examples/camera.ppm

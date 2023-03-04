@@ -8,20 +8,23 @@
 
 module Util (IsBool (..), group, ungroup, pad, padLeft, delIdx, replaceIdx,
              insertIdx, mvIdx, mapFst, mapSnd, splitOn, scan,
-             scanM, composeN, mapMaybe, uncons, repeated, splitAtExact,
+             scanM, composeN, mapMaybe, forMFilter, uncons, repeated, splitAtExact,
              transitiveClosure, transitiveClosureM,
              showErr, listDiff, splitMap, enumerate, iota, restructure,
-             onSnd, onFst, findReplace, swapAt, uncurry3,
+             onFst, onSnd, onFstM, onSndM, findReplace, swapAt, uncurry3,
              measureSeconds, sameConstructor,
              bindM2, foldMapM, lookupWithIdx, (...), zipWithT, for, getAlternative,
              Zippable (..), zipWithZ_, zipErr, forMZipped, forMZipped_,
              whenM, unsnocNonempty, anyM,
              File (..), FileHash, FileContents, addHash, readFileWithHash,
-             SnocList (..), snoc, unsnoc, toSnocList, emptySnocList) where
+             SnocList (..), snoc, unsnoc, toSnocList, emptySnocList, Tree (..), zipTrees,
+             liftMaybe, tryUnsnoc) where
 
 import Crypto.Hash
 import Data.Functor.Identity (Identity(..))
 import Data.List (sort)
+import Data.Maybe (catMaybes)
+import Data.Hashable (Hashable)
 import qualified Data.List.NonEmpty as NE
 import qualified Data.ByteString    as BS
 import Data.Foldable
@@ -32,14 +35,19 @@ import qualified Data.Map.Strict as M
 import Control.Applicative
 import Control.Monad.State.Strict
 import System.CPUTime
+import Data.Store (Store (..))
+import GHC.Generics (Generic)
 import GHC.Base (getTag)
 import GHC.Exts ((==#), tagToEnum#)
+
+import Err
 
 class IsBool a where
   toBool :: a -> Bool
 
 iota :: (Enum a, Integral a) => a -> [a]
 iota n = take (fromEnum n) [0..] -- XXX: `[0..(n-1)]` is incorrect for unsigned ints!
+{-# INLINE iota #-}
 
 swapAt :: Int -> a -> [a] -> [a]
 swapAt _ _ [] = error "swapping to empty list"
@@ -49,8 +57,14 @@ swapAt n y (x:xs) = x:(swapAt (n-1) y xs)
 onFst :: (a -> b) -> (a, c) -> (b, c)
 onFst f (x, y) = (f x, y)
 
+onFstM :: (Functor m) => (a -> m b) -> (a, c) -> m (b, c)
+onFstM f (x, y) = (,y) <$> f x
+
 onSnd :: (a -> b) -> (c, a) -> (c, b)
 onSnd f (x, y) = (x, f y)
+
+onSndM :: (Functor m) => (a -> m b) -> (c, a) -> m (c, b)
+onSndM f (x, y) = (x,) <$> f y
 
 unsnocNonempty :: NonEmpty a -> ([a], a)
 unsnocNonempty (x:|xs) = case reverse (x:xs) of
@@ -137,6 +151,10 @@ mapMaybe f (x:xs) = let rest = mapMaybe f xs
                     in case f x of
                         Just y  -> y : rest
                         Nothing -> rest
+
+forMFilter :: Monad m => [a] -> (a -> m (Maybe b)) -> m [b]
+forMFilter xs f = catMaybes <$> mapM f xs
+{-# INLINE forMFilter #-}
 
 composeN :: Int -> (a -> a) -> a -> a
 composeN n f = foldr (.) id (replicate n f)
@@ -254,6 +272,11 @@ anyM f xs = do
   conds <- mapM f xs
   return $ any id conds
 
+liftMaybe :: Alternative m => Maybe a -> m a
+liftMaybe Nothing = empty
+liftMaybe (Just x) = pure x
+{-# INLINE liftMaybe #-}
+
 -- === zippable class ===
 
 class Zippable f where
@@ -271,7 +294,7 @@ zipWithZ_ :: Zippable f => MonadFail m => (a -> b -> m c) -> f a -> f b -> m ()
 zipWithZ_ f xs ys = zipWithZ f xs ys >> return ()
 
 zipErr :: MonadFail m => m a
-zipErr = fail "zip error"
+zipErr = fail $ "zip error. Call stack:\n" ++ printCurrentCallStack (getCurrentCallStack ())
 
 forMZipped :: Zippable f => MonadFail m => f a -> f b -> (a -> b -> m c) -> m (f c)
 forMZipped xs ys f = zipWithZ f xs ys
@@ -313,6 +336,23 @@ unsnoc (ReversedList x) = reverse x
 toSnocList :: [a] -> SnocList a
 toSnocList xs = ReversedList $ reverse xs
 {-# INLINE toSnocList #-}
+
+tryUnsnoc :: SnocList a -> Maybe (SnocList a, a)
+tryUnsnoc (ReversedList []) = Nothing
+tryUnsnoc (ReversedList (x:xs)) = Just (ReversedList xs, x)
+{-# INLINE tryUnsnoc #-}
+
+-- === generic tree ===
+
+data Tree a = Leaf a | Branch [Tree a]
+     deriving (Show, Eq, Ord, Generic, Functor, Foldable, Traversable)
+instance Store a => Store (Tree a)
+instance Hashable a => Hashable (Tree a)
+
+zipTrees :: Tree a -> Tree b -> Tree (a, b)
+zipTrees (Leaf x) (Leaf y) = Leaf (x, y)
+zipTrees (Branch xs) (Branch ys) | length xs == length ys = Branch $ zipWith zipTrees xs ys
+zipTrees _ _ = error "zip error"
 
 -- === bytestrings paired with their hash digest ===
 

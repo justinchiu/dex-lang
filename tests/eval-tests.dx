@@ -20,7 +20,7 @@
 > 6
 
 :p
-   vdot' : n:Type ?-> n=>Float -> n=>Float -> Float =
+   vdot' : (n:Type) ?-> n=>Float -> n=>Float -> Float =
      \x y. sum (for i. x.i * y.i * 2.0)
    x = iota (Fin 3)
    y = map n_to_f x
@@ -34,7 +34,9 @@
    sum (for i. sum z.i)
 > 18.
 
--- :p randint (hash 0 0) 10
+:p rand_int (new_key 0)
+> 431640317
+
 -- :p let x = unpack range 10000
 --        key = hash 0
 --    in sum (for i: randint (key x.i) 10)
@@ -66,7 +68,7 @@ fun = \y. sum (map n_to_f arr) + y
 > 3.
 
 :p
-   f : a:Type ?-> b:Type ?-> (a -> b & a) -> b =
+   f : (a:Type) ?-> (b:Type) ?-> (a -> b & a) -> b =
      \(x, y). x y
    f (\x. x, 1)
 > 1
@@ -105,13 +107,13 @@ fun = \y. sum (map n_to_f arr) + y
 > 1.414214
 
 :p sin 3.14159
-> 0.000003
+> 2.535182e-06
 
 :p cos 0.0
 > 1.
 
 :p tan 1.57079
-> 159378.27
+> 159378.3
 
 :p f_to_i $ floor 3.6
 > 3
@@ -185,10 +187,10 @@ sum (sum xs) ~~ (cumsum2d xs).(3@_).(2@_)
 
 infty = 1./0.
 :p infty
-> Infinity
+> inf
 
 :p nan
-> NaN
+> nan
 
 :p [ 0. < infty, 0. < nan, infty < 0., nan < 0., nan < nan, infty < infty ]
 > [True, False, False, False, False, False]
@@ -220,7 +222,7 @@ litArr = [10, 5, 3]
 :p
    k = new_key 0
    mean for i:(Fin 100). randn (ixkey k i)
-> -0.1158
+> 0.001849644
 
 :p hash (i_to_w64 0) 0
 > 0x6b20015999ba4efe
@@ -236,10 +238,10 @@ count = (w32_to_w64 (i_to_w32 608135816) .<<. 32) .|. (w32_to_w64 (i_to_w32 2242
 :p
    k = new_key 0
    mean for i:(Fin 100). sq $ randn (ixkey k i)
-> 1.25819
+> 0.7444913
 
-:p for i:(Fin 3) j:(Fin 2). rand $ ixkey2 (new_key 11) i j
-> [[0.474153, 0.914516], [0.79446, 0.276799], [0.589586, 0.711625]]
+:p for i:(Fin 3) j:(Fin 2). rand $ ixkey (new_key 11) (i, j)
+> [[0.1513238, 0.07557154], [0.1075971, 0.2888795], [0.5509554, 0.56872]]
 
 :p
   x = for i:(Fin 3). 0
@@ -272,39 +274,25 @@ count = (w32_to_w64 (i_to_w32 608135816) .<<. 32) .|. (w32_to_w64 (i_to_w32 2242
 > (1, (2, 3))
 
 :p for i:(Fin 3). i
-> [(0@Fin 3), (1@Fin 3), (2@Fin 3)]
+> [0, 1, 2]
 
 :p for i:(Fin 3). i
-> [(0@Fin 3), (1@Fin 3), (2@Fin 3)]
+> [0, 1, 2]
 
 :p from_ordinal (Fin 1) 0
-> (0@Fin 1)
+> 0
 
 :p 0@(Fin 1)
-> (0@Fin 1)
+> 0
 
 :p 5@(Fin 5 & Fin 3)
-> ((1@Fin 5), (2@Fin 3))
+> (1, 2)
 
 :p ordinal (1@(Fin 5), 2@(Fin 3))
 > 5
 
 :p for i:(Fin 3 & Fin 5). i
-> [ ((0@Fin 3), (0@Fin 5))
-> , ((0@Fin 3), (1@Fin 5))
-> , ((0@Fin 3), (2@Fin 5))
-> , ((0@Fin 3), (3@Fin 5))
-> , ((0@Fin 3), (4@Fin 5))
-> , ((1@Fin 3), (0@Fin 5))
-> , ((1@Fin 3), (1@Fin 5))
-> , ((1@Fin 3), (2@Fin 5))
-> , ((1@Fin 3), (3@Fin 5))
-> , ((1@Fin 3), (4@Fin 5))
-> , ((2@Fin 3), (0@Fin 5))
-> , ((2@Fin 3), (1@Fin 5))
-> , ((2@Fin 3), (2@Fin 5))
-> , ((2@Fin 3), (3@Fin 5))
-> , ((2@Fin 3), (4@Fin 5)) ]@(Fin 3 & Fin 5)
+> [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (2, 0), (2, 1), (2, 2), (2, 3), (2, 4)]
 
 :p [1, 2, 3].(0@_)
 > 1
@@ -445,12 +433,12 @@ count = (w32_to_w64 (i_to_w32 608135816) .<<. 32) .|. (w32_to_w64 (i_to_w32 2242
 -- Not sure why the ordinary `sum/for` version doesn't work anymore
 :p
     n = 3 + 7
-    fsum view i:(Fin n). 1.0
+    fsum for i:(Fin n). 1.0
 > 10.
 
 :p
     n = 4
-    fsum view i:(Fin n). 1.0
+    fsum for i:(Fin n). 1.0
 > 4.
 
 :p
@@ -498,10 +486,10 @@ count = (w32_to_w64 (i_to_w32 608135816) .<<. 32) .|. (w32_to_w64 (i_to_w32 2242
 > [[1, 3], [2, 4]]
 
 :p argmin [1.0, 2.0, 0.4, 5.0]
-> (2@Fin 4)
+> 2
 
 :p select True (from_ordinal (Fin 2) 0) (from_ordinal (Fin 2) 1)
-> (0@Fin 2)
+> 0
 
 -- TODO: printing (also parsing) tables with alternative index sets
 -- :p
@@ -543,40 +531,6 @@ def eitherFloor (x:(Int|Float)) : Int = case x of
   x
 > (Right 1.2)
 
-def wbToEither {a b} : Iso {weights:a | biases:b} (a|b) =
-  fwd = \v.  case v of
-    {|weights=x|} -> Left x
-    {|biases=x|}  -> Right x
-  bwd = \v. case v of
-    Left x  -> {|weights=x|}
-    Right x -> {|biases=x|}
-  MkIso {fwd, bwd}
-
-instance {n m} [Ix n, Ix m] Ix {weights:n | biases:m}
-  size = size n + size m
-  ordinal = ordinal <<< app_iso wbToEither
-  unsafe_from_ordinal = unsafe_from_ordinal _ >>> rev_iso wbToEither
-
--- Sum types as flattened index sets!
-def Weights (n:Type) (m:Type) [Ix n, Ix m] : Type = n=>m=>Float
-def Biases  (n:Type)          [Ix n]       : Type = n=>Float
-def Params  (n:Type) (m:Type) [Ix n, Ix m] : Type = {weights:(n&m) | biases:n}=>Float
-
-w = for i:(Fin 2). for j:(Fin 3). (n_to_f (ordinal i)) * 3.0 + (n_to_f (ordinal j))
-b = for j:(Fin 2). neg (n_to_f (ordinal j) + 1.0)
-
-def flatten {n m} ((w,b):(Weights n m & Biases n)): Params n m =
-  for idx. case idx of
-    {| weights = (i,j) |} -> w.i.j
-    {| biases  = i     |} -> b.i
-
-def unflatten {n m} (params:Params n m) : (Weights n m & Biases n) =
-  ( for i. for j. params.({| weights = (i,j)|})
-  , for i.        params.({| biases  = i    |}))
-
-:p unflatten (flatten (w, b)) == (w, b)
-> True
-
 :p [1,2,3] == [1,2,3]
 > True
 
@@ -594,6 +548,22 @@ def unflatten {n m} (params:Params n m) : (Weights n m & Biases n) =
 
 :p (for i:(Fin 4). 1.0) == (for i:(Fin 4). 2.0)
 > False
+
+((Left 1) :: (Int | Bool)) == (Left 1 :: (Int | Bool))
+> True
+
+((Right False) :: (Int | Bool)) == (Left 1 :: (Int | Bool))
+> False
+
+((Right False) :: (Bool | Bool)) == (Left False :: (Bool | Bool))
+> False
+
+Just 1 == Just 1
+> True
+
+Just 1 == Just 0
+> False
+
 
 -- Userspace-Bool breaks these
 
@@ -636,7 +606,7 @@ for i:(Fin (-3)). 1.0
 > This might be due to a failure to find a viable interface implementation for: (FromInteger Nat)
 >
 > for i:(Fin (-3)). 1.0
-> ^^^^
+> ^^^^^^^^^^^^^^^^^^^^^
 
 x = 2 - 4
 > Type error:Couldn't synthesize a class dictionary for: (Sub Nat)
@@ -646,20 +616,16 @@ x = 2 - 4
 
 -- Make sure that we can construct and print an array using a pair index set
 for i:(Fin 2 & Fin 2). 1.0
-> [1., 1., 1., 1.]@(Fin 2 & Fin 2)
+> [1., 1., 1., 1.]
 
 1@(Fin 2 & Fin 2)
-> ((0@Fin 2), (1@Fin 2))
+> (0, 1)
 
 for i:(Fin 5). for j:(..i).
   ir = n_to_f $ ordinal i
   jr = n_to_f $ ordinal j
   ir * (ir + 1.0) / 2.0 + jr
-> [ [0.]@(..(0@Fin 5))
-> , [1., 2.]@(..(1@Fin 5))
-> , [3., 4., 5.]@(..(2@Fin 5))
-> , [6., 7., 8., 9.]@(..(3@Fin 5))
-> , [10., 11., 12., 13., 14.]@(..(4@Fin 5)) ]
+> [[0.], [1., 2.], [3., 4., 5.], [6., 7., 8., 9.], [10., 11., 12., 13., 14.]]
 
 -- TODO: fix!
 -- -- Exercise the use of free variables in the sum solver
@@ -783,7 +749,7 @@ hard = [(-1000.0), 1000.0, 1000.0, 0.1, 0.0]
 > True
 
 :p sum for i. exp $ (logsoftmax hard).i
-> 0.999971
+> 0.9999709
 
 :p all for i. abs ((softmax hard).i - exp (logsoftmax hard).i) < 0.0001
 > True
@@ -794,7 +760,7 @@ hard = [(-1000.0), 1000.0, 1000.0, 0.1, 0.0]
 str = ['x', 'y']
 
 :p str
-> ['x', 'y']
+> [0x78, 0x79]
 
 s1 = "hello world"
 
@@ -834,12 +800,13 @@ s1 = "hello world"
   sum zs + sum zs
 > 12
 
-triLit : i:(Fin 4)=>(..i)=>Int = [ [0], [1, 2], [3, 4, 5], [6, 7, 8, 9] ]
-triLit
-> [ [0]@(..(0@Fin 4))
-> , [1, 2]@(..(1@Fin 4))
-> , [3, 4, 5]@(..(2@Fin 4))
-> , [6, 7, 8, 9]@(..(3@Fin 4)) ]
+-- triLit : (i:Fin 4)=>(..i)=>Int =
+--   [ coerce_table _ [0]
+--   , coerce_table _ [1, 2]
+--   , coerce_table _ [3, 4, 5]
+--   , coerce_table _ [6, 7, 8, 9] ]
+-- triLit
+-- > [[0], [1, 2], [3, 4, 5], [6, 7, 8, 9]]
 
 -- @noinline
 def fromLeftFloat (x:(Float | Int)) : Float =
@@ -872,6 +839,16 @@ def f5 (x:Int) : Int = f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ x
 @noinline
 def f6 (x:Int) : Int = f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ x
 
+
+-- regression test for #1229 - checks that constraints and data args can be interleaved
+@noinline
+def interleave_args {n} (x:Float) (xs:n=>Float) : Float =
+  x + sum xs
+
+interleave_args 1.0 [2.0, 3.0]
+> 6.
+
+
 -- This will compile extremely slowly if non-inlining is broken
 :p f6 0
 > 100000
@@ -895,10 +872,20 @@ def f6 (x:Int) : Int = f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ x
 :p intpow 2 17
 > 131072
 
+def f (x:Float) : Float =
+  intpow x 2
+
+x2 = 3.1
+f x2
+> 9.61
+
+grad f x2
+> 6.2
+
 -- Integer utility tests
 
-:p map is_power_of_2 [0, 1, 2, 3, 256, 1024, 1024*1024, 1024*1024 + 1]
-> [False, True, True, False, True, True, True, False]
+:p map is_power_of_2 [0, 1, 2, 3, 256, 1023, 1024, 1024*1024, 1024*1024 + 1]
+> [False, True, True, False, True, False, True, True, False]
 
 :p map natlog2 [1, 2, 3, 4, 5, 1023, 1024, 1025]
 > [0, 1, 1, 2, 2, 9, 10, 10]
@@ -988,6 +975,10 @@ all for x:((Bool & Fin 3)=>(Fin 4)).
   x == (unsafe_from_ordinal _ (ordinal x))
 > True
 
+all $ for i:(Maybe (Fin 2)).
+  i == (unsafe_from_ordinal _ (ordinal i))
+> True
+
 def all_prefixes (s:String)  : List String =
   (AsList _ s') = s
   to_list for i. post_slice s' first_ix i
@@ -1006,3 +997,142 @@ def scan_over {n} (xs:n=>Float) : n=>Float =
 
 scan_over [1.0, 2.0, 3.0]
 > [1., 2., 4.]
+
+-- NonEmpty tests
+
+first_ix :: Unit
+> ()
+
+first_ix :: (Unit | Fin 2)
+> (Left ())
+
+first_ix :: Bool
+> False
+
+first_ix :: (Unit | Fin 2)=>(Unit | Fin 3)
+> [(Left ()), (Left ()), (Left ())]
+
+first_ix :: ((Unit | Fin 2) & (Unit | Fin 3))
+> ((Left ()), (Left ()))
+
+first_ix :: ((Unit | Fin 2) | Fin 3)
+> (Left (Left ()))
+
+
+-- Check that empty sets can't satisfy NonEmpty
+
+first_ix :: (Fin 0)
+> Type error:Couldn't synthesize a class dictionary for: (NonEmpty (Fin 0))
+>
+> first_ix :: (Fin 0)
+> ^^^^^^^^^
+
+first_ix :: (Fin 0 | Fin 0)
+> Type error:Couldn't synthesize a class dictionary for: (NonEmpty (Fin 0 | Fin 0))
+>
+> first_ix :: (Fin 0 | Fin 0)
+> ^^^^^^^^^
+
+first_ix :: (Fin 0 & Unit)
+> Type error:Couldn't synthesize a class dictionary for: (NonEmpty (Fin 0 & Unit))
+>
+> first_ix :: (Fin 0 & Unit)
+> ^^^^^^^^^
+
+
+-- Subset tests
+
+project Unit (inject (Unit | Fin 2) ())
+> (Just ())
+
+project Unit (inject (Unit | Fin 2) (0@(Fin 2)))
+> Nothing
+
+unsafe_project Unit (inject (Unit | Fin 2) ())
+> ()
+
+unsafe_project Unit (inject (Fin 2 | Unit) ())
+> ()
+
+:p unsafe_coerce (Fin 1 => (Nat & Nat)) ([1], [2])
+> [(1, 2)]
+
+-- Stack tests
+
+:p
+  with_stack Float \stack.
+    stack_push stack 1.0
+    stack_push stack 2.0
+    stack_extend stack [3.0, 4.0]
+    stack_extend stack (for i:(Fin 10). n_to_f $ ordinal i)
+    read_stack stack
+> (AsList 14 [1., 2., 3., 4., 0., 1., 2., 3., 4., 5., 6., 7., 8., 9.])
+
+:p
+  with_stack (Float & (Fin 2=>Float)) \stack.
+    stack_push stack (1.0, [1.0, 2.0])
+    stack_extend stack [(10.0, [10.0, 20.0]), (100.0, [100.0, 200.0])]
+    read_stack stack
+> (AsList 3 [(1., [1., 2.]), (10., [10., 20.]), (100., [100., 200.])])
+
+-- Checks for O(N^2) behavior
+:p
+  n = 1000000
+  with_stack Float \stack.
+    for i:(Fin n).
+      stack_push stack 2.0
+      stack_extend stack [3.0, 4.0]
+    AsList _ xs = read_stack stack
+    sum xs
+> 9000000.
+
+-- Non-data case scrutinee tests
+
+-- Check that we can print out a sum-typed non-data value
+Just f64_to_f
+> (Just <function of type (Float64 -> Float32)>)
+
+-- Check that we can print out a sum-typed non-data value that came
+-- from a case (this tickles ACase colliding with the code generated
+-- to print).  The @noinline defeats case-of-known-constructor.
+@noinline
+def id_bool (x:Bool) : Bool = x
+
+case (id_bool True) of
+  True -> Just f64_to_f
+  False -> Nothing
+> (Just <function of type (Float64 -> Float32)>)
+
+-- Check that we can later scrutinize a sum-typed non-data value that
+-- came from a case.
+foo = case (id_bool True) of
+  True -> Just f64_to_f
+  False -> Nothing
+
+case foo of
+  Just _ -> 1.0
+  Nothing -> 2.0
+> 1.
+
+-- Non-data catch tests
+
+-- Should be able to catch a function
+-- This is a regression test for Issue #1193.
+catch do f64_to_f
+> (Just <function of type (Float64 -> Float32)>)
+
+-- Should be able to catch a function-valued computation that fails
+catch do
+  x = if True
+    then throw ()
+    else 1.0
+  \y. x + y
+> Nothing
+
+-- Should be able to apply a function that came out of a catch
+frob : (Maybe (Float -> Float)) = catch do \x. x + x
+
+case frob of
+  Just func -> func 2.0
+  Nothing -> 0.0
+> 4.

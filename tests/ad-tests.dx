@@ -57,7 +57,7 @@ def sum' {n} (xs:n=>Float) : Float = yield_accum (AddMonoid Float) \ref. for i. 
 > 0.5
 
 :p
-  f : n:Type ?-> n=>Float -> n=>Float =
+  f : (n:Type) ?-> n=>Float -> n=>Float =
    \xs. for i. xs.i * xs.i
 
   jvp f [1.,2.] [3.,4.]
@@ -104,7 +104,7 @@ def sum' {n} (xs:n=>Float) : Float = yield_accum (AddMonoid Float) \ref. for i. 
 > (0.841471, -0.841471)
 
 :p (cos 1.0, deriv (deriv (deriv sin)) 1.0)
-> (0.540302, -0.540302)
+> (0.5403023, -0.5403023)
 
 :p check_deriv sin 1.0
 > True
@@ -156,13 +156,13 @@ tripleit : Float --o Float = \x. x + x + x
 > 3.
 
 :p
-  f : n:Type ?-> Ix n ?=> Float --o n=>Float = \x. for i. x
+  f : (n:Type) ?-> Ix n ?=> Float --o n=>Float = \x. for i. x
 
   transpose_linear f [1.0, 2.0]
 > 3.
 
 :p
-  f : n:Type ?-> n=>Float --o n=>Float = \x. for i. x.i * 2.0
+  f : (n:Type) ?-> n=>Float --o n=>Float = \x. for i. x.i * 2.0
 
   transpose_linear f [1.0, 2.0]
 > [2., 4.]
@@ -202,7 +202,7 @@ myOtherSquare : Float -> Float =
 > 10.
 
 :p
-  f : n:Type ?-> n=>Float -> n=>Float =
+  f : (n:Type) ?-> n=>Float -> n=>Float =
     \xs. for i. xs.i * xs.i
 
   jvp f [1.,2.] [3.,4.]
@@ -271,18 +271,6 @@ vec = [1.]
   f = \x. for i:(Fin 4). { x=x * x * (n_to_f $ ordinal i) }
   jvp f 2.0 1.0
 > [{x = 0.}, {x = 4.}, {x = 8.}, {x = 12.}]
-
-:p
-  s : { a : Float | b : Float } = case 2 == 2 of
-    False -> {| a=2.0 |}
-    True -> {| b=5.0 |}
-  f = \x.
-    case s of
-      {| a=a |} -> 2.0 * (a + x)
-      {| b=b |} -> b * x
-  (y, df) = linearize f 2.0
-  check_deriv_base f 2.0
-> True
 
 :p
   f = max 0.0
@@ -371,8 +359,13 @@ grad (\x . (min' x (x+1))) 1.0
 grad (\x . [x].(argmin [x])) 1.0
 > 1.
 
+-- -- Regression test for bug #821, AD of a record-typed function
+-- grad (get_at #foo) { foo = 1 }
+-- > {foo = 1.}
+
 -------------------- Custom linearization --------------------
 
+@noinline
 f = \x:Float. x * 2
 fLin = \x:Float. (f x, \xt:Float. xt * 4)
 
@@ -399,6 +392,7 @@ flip deriv 1.0 \x:Float.
   f2 x
 > 4.
 
+@noinline
 g = \x:(Float & Float). 4 .* x
 
 custom-linearization g \x. (g x, g x)
@@ -413,6 +407,7 @@ custom-linearization g \x. (g x, g x)
 
 data IHaveNoTangentType = MkIHaveNoTangentType
 
+@noinline
 noInputTangent = \x:IHaveNoTangentType. 2.0
 
 custom-linearization noInputTangent \x. (noInputTangent x, 0.0)
@@ -422,6 +417,7 @@ custom-linearization noInputTangent \x. (noInputTangent x, 0.0)
 >
 > but it doesn't have a well-defined tangent space.
 
+@noinline
 noOutputTangent = \x:Float. MkIHaveNoTangentType
 
 custom-linearization noOutputTangent \x. (noOutputTangent x, 0.0)
@@ -432,6 +428,7 @@ custom-linearization noOutputTangent \x. (noOutputTangent x, 0.0)
 > but it does not have a well-defined tangent space.
 
 -- Functions of multiple arguments should be supported
+@noinline
 h = \x:Float y:Float. x * 2 + y
 hLin = \x y. (h x y, \xt:Float yt:Float. xt + yt)
 
@@ -441,6 +438,7 @@ deriv (\x. h x x) 1.0 == deriv (\x. x + x) 1.0
 > True
 
 -- Index-polymorphic custom linearization
+@noinline
 def w {n} [Ix n] (x:n=>Float) : n=>Float = 2 .* x
 def wLin {n} [Ix n] (x:n=>Float) : (n=>Float & n=>Float -> n=>Float) = (w x, \xt:(n=>Float). 4 .* xt)
 
@@ -449,16 +447,29 @@ custom-linearization w wLin
 jvp (\x. w x) [1.0, 1.0] [1.0, 0.0]
 > [4., 0.]
 
--- This is a little unexpected at first, but the result makes sense when you think about it...
--- w has implicit args, so we're really taking a jvp of (w _ _), which is a function returned by
--- a partial application of w to some inference holes.
 jvp w [1.0, 1.0] [1.0, 0.0]
-> [2., 0.]
+> [4., 0.]
+
+------ standalone functions ------
+
+@noinline
+def xy2 (x:Float) (y:Float) : Float =
+  x * y * y
+
+:p check_deriv (\x. xy2 x x) 2.0
+> True
+:p check_deriv (\x. xy2 x 3.0) 2.0
+> True
+:p check_deriv (\x. xy2 2.0 3.0) 2.0
+> True
+:p check_deriv (\x. xy2 5.0 x) 2.0
+> True
 
 ------ Symbolic tangents ------
 
 ST = SymbolicTangent
 
+@noinline
 def q (x:Float) (y:Float) : Float = x * 2 + y
 def qLin (x:Float) (y:Float) : _ =
   def lin (xt:ST Float) (yt: ST Float) : Float =

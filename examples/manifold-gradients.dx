@@ -1,8 +1,8 @@
-' ## Gradients on manifolds
+'# Gradients on manifolds
 An example of how to generalize the Dex `linearize` and `grad` functions to take
 derivatives and gradients of functions on manifolds.
 
-' ### Tangent space
+'## Tangent space
 The difference between differentiating on $\mathbb{R}^n$ and on general
 manifolds is that in the general case, the manifold tangent space type may be
 different to the manifold representation type. The tangent space at a single
@@ -75,7 +75,7 @@ point $x$ as both the tangent space, and as a local chart.
 instance of a TangentSpace for vector spaces. In this case, we view the tangent
 space at $x$ to be just a copy of the vector space, centred on $x$.
 
-instance {a} [VSpace a] TangentSpace a a
+instance TangentSpace a a given {a} [VSpace a]
   tangentExponentialMap = \ p v . p + v
   tangentLogarithmMap = \ p q . q - p
 
@@ -90,7 +90,7 @@ def manifoldGrad
   transpose_linear (snd linearized) 1.0
 
 
-' ### Equivalence to standard differentiation
+'## Equivalence to standard differentiation
 As a sense check we make sure that these functions give the same output as the
 non-manifold versions on functions which are defined on $\mathbb{R}^n$.
 
@@ -110,7 +110,7 @@ snd original x ~~ snd new x
 > True
 
 
-' ### Simple example: Circle
+'## Simple example: Circle
 For a simple demonstration of this framework, consider the manifold $S^1$, i.e.
 the circle. This can be defined as the set of points in $\mathbb{R}^2$ at unit
 distance from the origin:
@@ -210,7 +210,7 @@ def s1ToR2 (S{x=x, y=y}: S1) : (Fin 2 => Float) =
 
 -- Two arbitrary points on the circle, not normalized.
 circlePointOne = S{x=3.4, y=0.2}
-circlePointTwo = S{x=-1.0, y=1.8}
+circlePointTwo = S{x= -1.0, y=1.8}
 
 -- Applying tangent mappings at circlePointTwo, to circlePointOne
 intermediateLog: Float = tangentLogarithmMap circlePointTwo circlePointOne
@@ -238,7 +238,7 @@ s1ManifoldGrad getX (S{x=sqrt 0.5, y=sqrt 0.5}) ~~ - (sqrt 0.5)
 > True
 
 
-' ### Further example: Quaternions
+'## Further example: Quaternions
 For a more complex use-case, we consider the SO3 manifold of 3D rotations, with
 the usual 4D quaternion representation. Again, the full definition of
 quaternions has a few subtleties, but a simple intuition is that a rotation by
@@ -310,7 +310,7 @@ instance Mul Quaternion
   one = quatIdent
 
 def quatConj ((Q {x, y, z, w}):Quaternion) : Quaternion =
-  Q {x=-x, y=-y, z=-z, w=w}
+  Q {x = -x, y = -y, z = -z, w = w}
 
 def quatInv (q:Quaternion) : Quaternion =
   m = magnitude $ quatAsVec q
@@ -405,8 +405,8 @@ quatLooseTolerance = quatFromVec $ for i. looseTolerance
 tangentLooseTolerance : R3 = for i. looseTolerance
 
 -- Just arbitrary quaternions.
-quatForTestOne = quatNormalize (Q{w=1.0, x=0.5, y=-0.2, z=0.4})
-quatForTestTwo = quatNormalize (Q{w=-0.4, x=0.5, y=0.8, z=-0.9})
+quatForTestOne = quatNormalize (Q{w =  1.0, x = 0.5, y = -0.2, z =  0.4})
+quatForTestTwo = quatNormalize (Q{w = -0.4, x = 0.5, y =  0.8, z = -0.9})
 
 allclose quatLooseTolerance rtol (quatExpAtIdent $ quatExpAtIdentInv quatForTestOne) (quatForTestOne)
 > True
@@ -467,7 +467,7 @@ def quatRoll (Q{x, y, z, w} : Quaternion) : Float =
 -- A fixed quaternion with roll = 0.5.
 quatSomeRoll = Q{x=0.247, y=0., z=0., w=0.969}
 quatRoll quatSomeRoll
-> 0.49916
+> 0.4991595
 
 -- A function to compose a given quaternion with fixed rotation.
 def quatAddSomeRoll (q: Quaternion) : Quaternion = q * quatSomeRoll
@@ -493,14 +493,14 @@ def quatGrad (f: Quaternion -> Float) (x: Quaternion) : R3 = manifoldGrad f x
 -- see that the only way to modify the roll is by adding further rotation in the
 -- roll direction.
 quatGrad quatRoll quatSomeRoll
-> [0.999973, 0., 0.]
+> [0.9999734, 0., 0.]
 
 
 -- However, at other points, we can also modify the roll of the rotation by
 -- moving in pitch and/or yaw directions. This demonstrates that the Euler
 -- angles are not independent.
 quatGrad quatRoll quatForTestOne
-> [1.041025, 0.594871, 0.]
+> [1.041025, 0.5948712, 7.450581e-09]
 
 quatGrad quatRoll quatForTestTwo
-> [-0.570283, 0.83349, -0.]
+> [-0.5702829, 0.8334905, -8.381903e-09]

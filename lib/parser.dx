@@ -1,6 +1,8 @@
+'# Parser Combinators
 
+'Basic combinator-based parser in Dex (as opposed to of Dex).
 
-'Utilities unrelated to parsing
+'## Utilities unrelated to parsing
 
 def from_ordinal_exc (n:Type) [Ix n] (i:Nat) : {Except} n =
   if (0 <= i) && (i < size n)
@@ -9,20 +11,20 @@ def from_ordinal_exc (n:Type) [Ix n] (i:Nat) : {Except} n =
 
 -- TODO: allow this to happen in-place
 -- TODO: if it takes too long to make that possible, start with a bounded version
-def push {h a} (ref:Ref h (List a)) (x:a) : {State h} Unit =
+def push {h a} [Data a] (ref:Ref h (List a)) (x:a) : {State h} Unit =
   l = get ref
   ref := l <> AsList _ [x]
 
-def index_list {a} (l:List a) (i:Nat) : {Except} a =
+def index_list {a} [Data a] (l:List a) (i:Nat) : {Except} a =
   (AsList n xs) = l
   xs.(from_ordinal_exc _ i)
 
-'The Parser type
+'## The Parser type
 
-def ParserHandle (h:Type) : Type = (String & Ref h Nat)
+def ParserHandle (h:Heap) : Type = (String & Ref h Nat)
 
 data Parser a:Type =
-  MkParser (h:Type ?-> ParserHandle h -> {Except, State h} a)
+  MkParser ((h:Heap) ?-> ParserHandle h -> {Except, State h} a)
 
 def parse {a h} (handle:ParserHandle h) (parser:Parser a) : {Except, State h} a =
   (MkParser f) = parser
@@ -34,7 +36,7 @@ def run_parser_partial {a} (s:String) (parser:Parser a) : Maybe a =
     catch $ do
       f (s, pos)
 
-'Primitive combinators
+'## Primitive combinators
 
 def p_char (c:Char) : Parser Unit = MkParser \(s, posRef).
   i = get posRef
@@ -79,7 +81,7 @@ def try {a} (parser:Parser a) : Parser a = MkParser \h.
       throw ()
     Just x -> x
 
-'Derived combinators
+'## Derived combinators
 
 def parse_digit : Parser Int = try $ MkParser \h.
   c = parse h $ parse_any
@@ -90,7 +92,7 @@ def parse_digit : Parser Int = try $ MkParser \h.
 def optional {a} (p:Parser a) : Parser (Maybe a) =
   (MkParser \h. Just (parse h p)) <|> returnP Nothing
 
-def parse_many {a} (parser:Parser a) : Parser (List a) = MkParser \h.
+def parse_many {a} [Data a] (parser:Parser a) : Parser (List a) = MkParser \h.
   yield_state (AsList _ []) \results.
     iter \_.
       maybeVal = parse h $ optional parser

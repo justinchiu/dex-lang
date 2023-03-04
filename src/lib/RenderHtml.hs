@@ -20,12 +20,12 @@ import Control.Monad
 import Text.Megaparsec hiding (chunk)
 import Text.Megaparsec.Char as C
 
-import Paths_dex  (getDataFileName)
-import Syntax
-import PPrint
-import Parser
-import Serialize ()
 import Err
+import Lexing (Parser, symChar, keyWordStrs, symbol, parseit, withSource)
+import Paths_dex  (getDataFileName)
+import PPrint ()
+import Types.Misc
+import Types.Source
 
 cssSource :: T.Text
 cssSource = unsafePerformIO $
@@ -73,7 +73,7 @@ instance ToMarkup Output where
 
 instance ToMarkup SourceBlock where
   toMarkup block = case sbContents block of
-    ProseBlock s -> cdiv "prose-block" $ mdToHtml s
+    (Misc (ProseBlock s)) -> cdiv "prose-block" $ mdToHtml s
     _ -> cdiv "code-block" $ highlightSyntax (sbText block)
 
 mdToHtml :: T.Text -> Html

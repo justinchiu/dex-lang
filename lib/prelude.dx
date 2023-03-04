@@ -8,6 +8,7 @@
 
 Unit = %UnitType
 Type = %TyKind
+Heap = %HeapType
 Effects = %EffKind
 Fields = %LabeledRowKind
 
@@ -29,11 +30,17 @@ RawPtr : Type = %Word8Ptr
 Int = Int32
 Float = Float32
 
-Nat = Word32
+def the (a:Type) (x:a) = x
+
+interface Data a
+  do_not_implement_this_interface_for_the_compiler_relies_on_the_invariant_it_protects : a -> a
 
 '### Casting
 
 def internal_cast {a} (b:Type) (x:a) : b = %cast b x
+
+def unsafe_coerce {a} (b:Type) [Data a, Data b] (x:a) : b = %unsafeCoerce b x
+def uninitialized_value {a} [Data a] : a = %garbageVal a
 
 def f64_to_f (x : Float64) : Float   = internal_cast _ x
 def f32_to_f (x : Float32) : Float   = internal_cast _ x
@@ -42,45 +49,66 @@ def f_to_f32 (x : Float)   : Float32 = internal_cast _ x
 def i64_to_i (x : Int64)   : Int     = internal_cast _ x
 def i32_to_i (x : Int32)   : Int     = internal_cast _ x
 def w8_to_i  (x : Word8)   : Int     = internal_cast _ x
-def w8_to_n  (x : Word8)   : Nat     = internal_cast _ x
 def i_to_i64 (x : Int)     : Int64   = internal_cast _ x
 def i_to_i32 (x : Int)     : Int32   = internal_cast _ x
 def i_to_w8  (x : Int)     : Word8   = internal_cast _ x
 def i_to_w32 (x : Int)     : Word32  = internal_cast _ x
 def i_to_w64 (x : Int)     : Word64  = internal_cast _ x
 def w32_to_w64 (x : Word32): Word64  = internal_cast _ x
-def i_to_f (x:Int) : Float = internal_cast _ x
-def i64_to_raw_ptr (x:Int64 ) : RawPtr = internal_cast _ x
+def i_to_f (x:Int)   : Float = internal_cast _ x
+def f_to_i (x:Float) : Int   = internal_cast _ x
 def raw_ptr_to_i64 (x:RawPtr) : Int64  = internal_cast _ x
-def n_to_i64 (x : Nat) : Int64 = internal_cast _ x
-def n_to_i32 (x : Nat) : Int32 = internal_cast _ x
-def n_to_w32 (x : Nat) : Word32  = internal_cast _ x
-def n_to_w64 (x : Nat) : Word64  = internal_cast _ x
-def i64_to_n (x : Int64) : Nat = internal_cast _ x
-def i32_to_n (x : Int32) : Nat = internal_cast _ x
 
-def f_to_i (x:Float) : Int = internal_cast _ x
-def f_to_n (x:Float) : Nat = internal_cast _ x
-def n_to_f (x : Nat) : Float = internal_cast _ x
-def n_to_w8 (x : Nat) : Word8   = internal_cast _ x
+Nat = %Nat
+NatRep = Word32
 
-interface FromNatural a
-  from_natural : Word64 -> a
+def nat_to_rep (x : Nat)    : NatRep = %projNewtype x
+def rep_to_nat (x : NatRep) : Nat    = %NatCon x
 
-instance FromNatural Float32
-  from_natural = \x. internal_cast _ x
+def n_to_w8  (x : Nat) : Word8   = internal_cast _ $ nat_to_rep x
+def n_to_w32 (x : Nat) : Word32  = internal_cast _ $ nat_to_rep x
+def n_to_w64 (x : Nat) : Word64  = internal_cast _ $ nat_to_rep x
+def n_to_i32 (x : Nat) : Int32   = internal_cast _ $ nat_to_rep x
+def n_to_i64 (x : Nat) : Int64   = internal_cast _ $ nat_to_rep x
+def n_to_f32 (x : Nat) : Float32 = internal_cast _ $ nat_to_rep x
+def n_to_f64 (x : Nat) : Float64 = internal_cast _ $ nat_to_rep x
+def n_to_f   (x : Nat) : Float   = internal_cast _ $ nat_to_rep x
 
-instance FromNatural Float64
-  from_natural = \x. internal_cast _ x
+def w8_to_n  (x : Word8)   : Nat = rep_to_nat $ internal_cast _ x
+def w32_to_n (x : Word32)  : Nat = rep_to_nat $ internal_cast _ x
+def w64_to_n (x : Word64)  : Nat = rep_to_nat $ internal_cast _ x
+def i32_to_n (x : Int32)   : Nat = rep_to_nat $ internal_cast _ x
+def i64_to_n (x : Int64)   : Nat = rep_to_nat $ internal_cast _ x
+def f32_to_n (x : Float32) : Nat = rep_to_nat $ internal_cast _ x
+def f64_to_n (x : Float64) : Nat = rep_to_nat $ internal_cast _ x
+def f_to_n   (x : Float)   : Nat = rep_to_nat $ internal_cast _ x
 
-instance FromNatural Int32
-  from_natural = \x. internal_cast _ x
+interface FromUnsignedInteger a
+  from_unsigned_integer : Word64 -> a
 
-instance FromNatural Word32
-  from_natural = \x. internal_cast _ x
+instance FromUnsignedInteger Word8
+  from_unsigned_integer = \x. internal_cast _ x
 
-instance FromNatural Word64
-  from_natural = \x. x
+instance FromUnsignedInteger Word32
+  from_unsigned_integer = \x. internal_cast _ x
+
+instance FromUnsignedInteger Word64
+  from_unsigned_integer = \x. x
+
+instance FromUnsignedInteger Int32
+  from_unsigned_integer = \x. internal_cast _ x
+
+instance FromUnsignedInteger Int64
+  from_unsigned_integer = \x. internal_cast _ x
+
+instance FromUnsignedInteger Float32
+  from_unsigned_integer = \x. internal_cast _ x
+
+instance FromUnsignedInteger Float64
+  from_unsigned_integer = \x. internal_cast _ x
+
+instance FromUnsignedInteger Nat
+  from_unsigned_integer = w64_to_n
 
 interface FromInteger a
   from_integer : Int64 -> a
@@ -135,7 +163,7 @@ def high_word (x : Word64) : Word32 = internal_cast _ x
 Things that can be added.
 This defines the `Add` [group](https://en.wikipedia.org/wiki/Group_(mathematics)) and its operators.
 
-interface Add a
+interface [Data a] Add a
   add : a -> a -> a
   zero : a
 
@@ -147,44 +175,49 @@ def (-) {a} [Sub a] : a -> a -> a = sub
 
 instance Add Float64
   add = \x y. %fadd x y
-  zero = f_to_f64 0.0
+  zero = 0
 instance Sub Float64
   sub = \x y. %fsub x y
 
 instance Add Float32
   add = \x y. %fadd x y
-  zero = f_to_f32 0.0
+  zero = 0
 instance Sub Float32
   sub = \x y. %fsub x y
 
 instance Add Int64
   add = \x y. %iadd x y
-  zero = i_to_i64 0
+  zero = 0
 instance Sub Int64
   sub = \x y. %isub x y
 
 instance Add Int32
   add = \x y. %iadd x y
-  zero = i_to_i32 0
+  zero = 0
 instance Sub Int32
   sub = \x y. %isub x y
 
 instance Add Word8
   add = \x y. %iadd x y
-  zero = i_to_w8 0
+  zero = 0
 instance Sub Word8
   sub = \x y. %isub x y
 
 instance Add Word32
   add = \x y. %iadd x y
-  zero = i_to_w32 0
--- XXX: we don't implement `Sub Word32` because we use `Word32` as `Nat`
+  zero = 0
+instance Sub Word32
+  sub = \x y. %isub x y
 
 instance Add Word64
   add = \x y. %iadd x y
-  zero = i_to_w64 0
+  zero = 0
 instance Sub Word64
   sub = \x y. %isub x y
+
+instance Add Nat
+  add = \x y. rep_to_nat $ %iadd (nat_to_rep x) (nat_to_rep y)
+  zero = 0
 
 instance Add Unit
   add = \x y. ()
@@ -192,17 +225,19 @@ instance Add Unit
 instance Sub Unit
   sub = \x y. ()
 
-instance {n a} [Add a] Add (n->a)
-  add = \f g. \x. (f x) + (g x)
-  zero = \x. zero
-instance {n a} [Sub a] Sub (n->a)
-  sub = \f g. \x. (f x) - (g x)
+-- Instances for Add that we could give to unary functions if we
+-- choose to: https://github.com/google-research/dex-lang/issues/1230
+-- instance Add (n->a) given {n a} [Add a]
+--   add = \f g. \x. (f x) + (g x)
+--   zero = \x. zero
+-- instance Sub (n->a) given {n a} [Sub a]
+--   sub = \f g. \x. (f x) - (g x)
 
 '#### Mul
 Things that can be multiplied.
 This defines the `Mul` [Monoid](https://en.wikipedia.org/wiki/Monoid), and its operator.
 
-interface Mul a
+interface [Data a] Mul a
   mul : a -> a -> a
   one : a
 
@@ -218,31 +253,37 @@ instance Mul Float32
 
 instance Mul Int64
   mul = \x y. %imul x y
-  one = i_to_i64 1
+  one = 1
 
 instance Mul Int32
   mul = \x y. %imul x y
-  one = i_to_i32 1
+  one = 1
 
 instance Mul Word8
   mul = \x y. %imul x y
-  one = i_to_w8 1
+  one = 1
 
 instance Mul Word32
   mul = \x y. %imul x y
-  one = i_to_w32 1
+  one = 1
 
 instance Mul Word64
   mul = \x y. %imul x y
-  one = i_to_w64 1
+  one = 1
+
+instance Mul Nat
+  mul = \x y. rep_to_nat $ %imul (nat_to_rep x) (nat_to_rep y)
+  one = 1
 
 instance Mul Unit
   mul = \x y. ()
   one = ()
 
-instance {n a} [Mul a] Mul (n->a)
-  mul = \f g. \x. (f x) * (g x)
-  one = \x. one
+-- Instance for Mul that we could give to unary functions if we
+-- choose to: https://github.com/google-research/dex-lang/issues/1230
+-- instance Mul (n->a) given {n a} [Mul a]
+--   mul = \f g. \x. (f x) * (g x)
+--   one = \x. one
 
 '#### Integral
 Integer-like things.
@@ -271,6 +312,10 @@ instance Integral Word64
   idiv = \x y.  %idiv x y
   rem  = \x y.  %irem x y
 
+instance Integral Nat
+  idiv = \x y. rep_to_nat $ %idiv (nat_to_rep x) (nat_to_rep y)
+  rem  = \x y. rep_to_nat $ %irem (nat_to_rep x) (nat_to_rep y)
+
 '#### Fractional
 Rational-like things.
 Includes floating point and two field rational representations.
@@ -286,7 +331,7 @@ instance Fractional Float32
 
 '## Index set interface and instances
 
-interface Ix n
+interface [Data n] Ix n
   size n : Nat
   ordinal : n -> Nat
   unsafe_from_ordinal n : Nat -> n
@@ -295,10 +340,15 @@ def Fin (n:Nat) : Type = %Fin n
 
 -- version of subtraction on Nats that clamps at zero
 def (-|) (x: Nat) (y:Nat) : Nat =
-  requires_clamp = %ilt x y
-  %select requires_clamp 0 (%isub x y)
+  x' = nat_to_rep x
+  y' = nat_to_rep y
+  requires_clamp = %ilt x' y'
+  rep_to_nat $ %select requires_clamp 0 (%isub x' y')
 
-def unsafe_nat_diff (x:Nat) (y:Nat) : Nat = %isub x y
+def unsafe_nat_diff (x:Nat) (y:Nat) : Nat =
+  x' = nat_to_rep x
+  y' = nat_to_rep y
+  rep_to_nat $ %isub x' y'
 
 -- `(i..)` parses as `RangeFrom _ i`
 data RangeFrom q:Type i:q = UnsafeMkRangeFrom Nat
@@ -312,22 +362,22 @@ data RangeTo q:Type i:q = UnsafeMkRangeTo Nat
 -- `(..<i)` parses as `RangeToExc _ i`
 data RangeToExc q:Type i:q = UnsafeMkRangeToExc Nat
 
-instance {q:Type} {i:q} [Ix q] Ix (RangeFrom q i)
+instance Ix (RangeFrom q i) given {q:Type} {i:q} [Ix q]
   size = unsafe_nat_diff (size q) (ordinal i)
   ordinal = \(UnsafeMkRangeFrom j). j
   unsafe_from_ordinal = \j. UnsafeMkRangeFrom j
 
-instance {q:Type} {i:q} [Ix q] Ix (RangeFromExc q i)
+instance Ix (RangeFromExc q i) given {q:Type} {i:q} [Ix q]
   size = unsafe_nat_diff (size q) (ordinal i + 1)
   ordinal = \(UnsafeMkRangeFromExc j). j
   unsafe_from_ordinal = \j. UnsafeMkRangeFromExc j
 
-instance {q:Type} {i:q} [Ix q] Ix (RangeTo q i)
+instance Ix (RangeTo q i) given {q:Type} {i:q} [Ix q]
   size = ordinal i + 1
   ordinal = \(UnsafeMkRangeTo j). j
   unsafe_from_ordinal = \j. UnsafeMkRangeTo j
 
-instance {q:Type} {i:q} [Ix q] Ix (RangeToExc q i)
+instance Ix (RangeToExc q i) given {q:Type} {i:q} [Ix q]
   size = ordinal i
   ordinal = \(UnsafeMkRangeToExc j). j
   unsafe_from_ordinal = \j. UnsafeMkRangeToExc j
@@ -337,41 +387,41 @@ instance Ix Unit
   ordinal = \_. 0
   unsafe_from_ordinal = \_. ()
 
-def iota (n:Type) [Ix n] : n=>Nat = view i. ordinal i
+def iota (n:Type) [Ix n] : n=>Nat = for i. ordinal i
 
 '## Arithmetic instances for table types
 
-instance {a n} [Add a] Add (n=>a)
+instance Add (n=>a) given {a n} [Add a]
   add = \xs ys. for i. xs.i + ys.i
   zero = for _. zero
-instance {a n} [Sub a] Sub (n=>a)
+instance Sub (n=>a) given {a n} [Sub a]
   sub = \xs ys. for i. xs.i - ys.i
 
-instance {a n} [Add a] Add (i:n => (i..) => a)  -- Upper triangular tables
+instance Add ((i:n) => (i..) => a) given {a n} [Add a]  -- Upper triangular tables
   add = \xs ys. for i. xs.i + ys.i
   zero = for _. zero
-instance {a n} [Sub a] Sub (i:n => (i..) => a)  -- Upper triangular tables
+instance Sub ((i:n) => (i..) => a) given {a n} [Sub a]  -- Upper triangular tables
   sub = \xs ys. for i. xs.i - ys.i
 
-instance {a n} [Add a] Add (i:n => (..i) => a)  -- Lower triangular tables
+instance Add ((i:n) => (..i) => a) given {a n} [Add a]  -- Lower triangular tables
   add = \xs ys. for i. xs.i + ys.i
   zero = for _. zero
-instance {a n} [Sub a] Sub (i:n => (..i) => a)  -- Lower triangular tables
+instance Sub ((i:n) => (..i) => a) given {a n} [Sub a]  -- Lower triangular tables
   sub = \xs ys. for i. xs.i - ys.i
 
-instance {a n} [Add a] Add (i:n => (..<i) => a)
+instance Add ((i:n) => (..<i) => a) given {a n} [Add a]
   add = \xs ys. for i. xs.i + ys.i
   zero = for _. zero
-instance {a n} [Sub a] Sub (i:n => (..<i) => a)
+instance Sub ((i:n) => (..<i) => a) given {a n} [Sub a]
   sub = \xs ys. for i. xs.i - ys.i
 
-instance {a n} [Add a] Add (i:n => (i<..) => a)
+instance Add ((i:n) => (i<..) => a) given {a n} [Add a]
   add = \xs ys. for i. xs.i + ys.i
   zero = for _. zero
-instance {a n} [Sub a] Sub (i:n => (i<..) => a)
+instance Sub ((i:n) => (i<..) => a) given {a n} [Sub a]
   sub = \xs ys. for i. xs.i - ys.i
 
-instance {a n} [Mul a] Mul (n=>a)
+instance Mul (n=>a) given {a n} [Mul a]
   mul = \xs ys. for i. xs.i * ys.i
   one = for _. one
 
@@ -383,14 +433,14 @@ def fst {a b} ((x, _): (a & b)) : a = x
 def snd {a b} ((_, y): (a & b)) : b = y
 def swap {a b} ((x, y):(a&b)) : (b&a) = (y, x)
 
-instance {a b} [Add a, Add b] Add (a & b)
+instance Add (a & b) given {a b} [Add a, Add b]
   add = \(a, b) (c, d). ( (a + c), (b + d))
   zero = (zero, zero)
 
-instance {a b} [Sub a, Sub b] Sub (a & b)
+instance Sub (a & b) given {a b} [Sub a, Sub b]
   sub = \(a, b) (c, d). ( (a - c), (b - d))
 
-instance {a b} [Ix a, Ix b] Ix (a & b)
+instance Ix (a & b) given {a b} [Ix a, Ix b]
   size = size a * size b
   ordinal = \(i, j). (ordinal i * size b) + ordinal j
   unsafe_from_ordinal = \o.
@@ -417,26 +467,28 @@ def neg  {a} [VSpace a] (v:a) : a = (-1.0) .* v
 instance VSpace Float
   scale_vec = \x y. x * y
 
-instance {a n} [VSpace a] VSpace (n=>a)
+instance VSpace (n=>a) given {a n} [VSpace a]
   scale_vec = \s xs. for i. s .* xs.i
 
-instance {a b} [VSpace a, VSpace b] VSpace (a & b)
+instance VSpace (a & b) given {a b} [VSpace a, VSpace b]
   scale_vec = \ s (a, b) . (scale_vec s a, scale_vec s b)
 
-instance {a n} [VSpace a] VSpace (i:n => (..i) => a)
+instance VSpace ((i:n) => (..i) => a) given {a n} [VSpace a]
   scale_vec = \s xs. for i. s .* xs.i
 
-instance {a n} [VSpace a] VSpace (i:n => (i..) => a)
+instance VSpace ((i:n) => (i..) => a) given {a n} [VSpace a]
   scale_vec = \s xs. for i. s .* xs.i
 
-instance {a n} [VSpace a] VSpace (i:n => (..<i) => a)
+instance VSpace ((i:n) => (..<i) => a) given {a n} [VSpace a]
   scale_vec = \s xs. for i. s .* xs.i
 
-instance {a n} [VSpace a] VSpace (i:n => (i<..) => a)
+instance VSpace ((i:n) => (i<..) => a) given {a n} [VSpace a]
   scale_vec = \s xs. for i. s .* xs.i
 
-instance {a n} [VSpace a] VSpace (n->a)
-  scale_vec = \s f. \x. s .* (f x)
+-- Instance for VSpace that we could give to unary functions if we
+-- choose to: https://github.com/google-research/dex-lang/issues/1230
+-- instance VSpace (n->a) given {a n} [VSpace a]
+--   scale_vec = \s f. \x. s .* (f x)
 
 instance VSpace Unit
   scale_vec = \_ _. ()
@@ -468,6 +520,8 @@ def not  (x:Bool) : Bool =
 '## More Boolean operations
 TODO: move these with the others?
 
+-- Can't use `%select` because it lowers to `ISelect`, which requires
+-- `a` to be a `BaseTy`.
 def select {a} (p:Bool) (x:a) (y:a) : a = case p of
   True  -> x
   False -> y
@@ -510,27 +564,28 @@ data (|) a b =
   Left  a
   Right b
 
-instance {a b} [Ix a, Ix b] Ix (a | b)
+instance Ix (a | b) given {a b} [Ix a, Ix b]
   size = size a + size b
   ordinal = \i. case i of
     Left ai  -> ordinal ai
     Right bi -> ordinal bi + size a
   unsafe_from_ordinal = \o.
-    as = size a
+    as = nat_to_rep $ size a
+    o' = nat_to_rep o
     -- TODO: Reshuffle the prelude to be able to use (<) here
-    case w8_to_b $ %ilt o as of
+    case w8_to_b $ %ilt o' as of
       True  -> Left $ unsafe_from_ordinal a o
       -- TODO: Reshuffle the prelude to be able to use `diff_nat` here
-      False -> Right $ unsafe_from_ordinal b (%isub o as)
+      False -> Right $ unsafe_from_ordinal b (rep_to_nat (%isub o' as))
 
 '## Subtraction on Nats
 -- TODO: think more about the right API here
 
 def unsafe_i_to_n (x:Int) : Nat =
-  internal_cast _ x
+  rep_to_nat $ internal_cast _ x
 
 def n_to_i (x:Nat) : Int =
-  internal_cast _ x
+  internal_cast _ $ nat_to_rep x
 
 def i_to_n (x:Int) : Maybe Nat =
   if w8_to_b $ %ilt x (0::Int)
@@ -541,7 +596,7 @@ def i_to_n (x:Int) : Maybe Nat =
 
 data Post segment:Type = UnsafeMkPost Nat
 
-instance {segment} [Ix segment] Ix (Post segment)
+instance Ix (Post segment) given {segment} [Ix segment]
   size = size segment + 1
   ordinal = \(UnsafeMkPost i). i
   unsafe_from_ordinal = \i. UnsafeMkPost i
@@ -558,8 +613,11 @@ interface [Ix n] NonEmpty n
 def last_ix {n} [NonEmpty n] : n =
   unsafe_from_ordinal _ $ unsafe_i_to_n $ n_to_i (size n) - 1
 
-instance {n} [Ix n] NonEmpty (Post n)
+instance NonEmpty (Post n) given {n} [Ix n]
   first_ix = unsafe_from_ordinal (Post n) 0
+
+instance NonEmpty Unit
+  first_ix = unsafe_from_ordinal _ 0
 
 '### Monoid
 A [monoid](https://en.wikipedia.org/wiki/Monoid) is a things that have an associative binary operator and an identity element.
@@ -570,13 +628,13 @@ It includes:
  - Concatenation of Lists (including strings)
 Monoids support `fold` operations, and similar.
 
-interface Monoid a
+interface [Data a] Monoid a
   mempty : a
   mcombine : a -> a -> a  -- can't use `<>` just for parser reasons?
 
 def (<>) {a} [Monoid a] : a -> a -> a = mcombine
 
-instance {a n} [Monoid a] Monoid (n=>a)
+instance Monoid (n=>a) given {a n} [Monoid a]
   mempty = for i. mempty
   mcombine = \x y. for i. mcombine x.i y.i
 
@@ -588,29 +646,28 @@ named-instance OrMonoid : Monoid Bool
   mempty = False
   mcombine = (||)
 
-named-instance AddMonoid : (a:Type) [Add a] Monoid a
+named-instance AddMonoid : Monoid a given (a:Type) [Add a]
   mempty = zero
   mcombine = add
 
-named-instance MulMonoid : (a:Type) [Mul a] Monoid a
+named-instance MulMonoid : Monoid a given (a:Type) [Mul a]
   mempty = one
   mcombine = mul
 
 '## Effects
 
-def Ref (r:Type) (a:Type) : Type = %Ref r a
+def Ref (r:Heap) (a:Type) [Data a] : Type = %Ref r a
 def get  {h s} (ref:Ref h s)       : {State h} s    = %get  ref
 def (:=) {h s} (ref:Ref h s) (x:s) : {State h} Unit = %put  ref x
 
 def ask  {h r} (ref:Ref h r)       : {Read  h} r    = %ask  ref
 
-data AccumMonoidData h w =
-  UnsafeMkAccumMonoidData b:Type (Monoid b)
+data AccumMonoidData (h:Heap) w = UnsafeMkAccumMonoidData b:Type (Monoid b)
 
-interface AccumMonoid h w
+interface AccumMonoid (h:Heap) w
   getAccumMonoidData : AccumMonoidData h w
 
-instance {n h w} [Ix n] [am : AccumMonoid h w] AccumMonoid h (n=>w)
+instance AccumMonoid h (n=>w) given {n h w} [Ix n] [am : AccumMonoid h w]
   getAccumMonoidData =
     (UnsafeMkAccumMonoidData b bm) = %projMethod0 am
     UnsafeMkAccumMonoidData b bm
@@ -621,74 +678,78 @@ def (+=) {h w} [am:AccumMonoid h w] (ref:Ref h w) (x:w) : {Accum h} Unit =
   combine = %projMethod1 bm
   %mextend ref empty (\x y. combine x y) x
 
-def (!) {h n a} (ref:Ref h (n=>a)) (i:n) : Ref h a = %indexRef ref i
-def fst_ref {h a b} (ref: Ref h (a & b)) : Ref h a = %fstRef ref
-def snd_ref {h a b} (ref: Ref h (a & b)) : Ref h b = %sndRef ref
+def (!) {h n a} [Data a] (ref:Ref h (n=>a)) (i:n) : Ref h a = %indexRef ref i
+def fst_ref {h a b} [Data a] (ref: Ref h (a & b)) : Ref h a = %fstRef ref
+def snd_ref {h a b} [Data b] (ref: Ref h (a & b)) : Ref h b = %sndRef ref
 
 def run_reader
-      {r a eff}
+      {r a eff} [Data r]
       (init:r)
-      (action: (h:Type ?-> Ref h r -> {Read h|eff} a))
+      (action: ((h:Heap) ?-> Ref h r -> {Read h|eff} a))
       : {|eff} a =
-    def explicitAction (h':Type) (ref:Ref h' r) : {Read h'|eff} a = action ref
+    def explicitAction (h':Heap) (ref:Ref h' r) : {Read h'|eff} a = action ref
     %runReader init explicitAction
 
 def with_reader
-      {r a eff}
+      {r a eff} [Data r]
       (init:r)
-      (action: (h:Type ?-> Ref h r -> {Read h|eff} a))
+      (action: ((h:Heap) ?-> Ref h r -> {Read h|eff} a))
       : {|eff} a =
     run_reader init action
 
-def MonoidLifter (b:Type) (w:Type) : Type = h:Type ?-> AccumMonoid h b ?=> AccumMonoid h w
+def MonoidLifter (b:Type) (w:Type) : Type = (h:Heap) ?-> AccumMonoid h b ?=> AccumMonoid h w
+
+named-instance mk_accum_monoid : AccumMonoid h w given {h w} (d:AccumMonoidData h w)
+  getAccumMonoidData = d
 
 def run_accum
-      {a b w eff}
+      {a b w eff} [Data w]
       [mlift:MonoidLifter b w]
       (bm:Monoid b)
-      (action: (h:Type ?-> AccumMonoid h b ?=> Ref h w -> {Accum h|eff} a))
+      (action: ((h:Heap) ?-> AccumMonoid h b ?=> Ref h w -> {Accum h|eff} a))
       : {|eff} (a & w) =
   empty = %projMethod0 bm
   combine = %projMethod1 bm
-  def explicitAction (h':Type) (ref:Ref h' w) : {Accum h'|eff} a =
+  def explicitAction (h':Heap) (ref:Ref h' w) : {Accum h'|eff} a =
     accumMonoidData : (AccumMonoidData h' b) = UnsafeMkAccumMonoidData b bm
-    accumBaseMonoid = %explicitDict (AccumMonoid h' b) accumMonoidData
+    accumBaseMonoid = mk_accum_monoid accumMonoidData
     action' = %explicitApply (%explicitApply action h') accumBaseMonoid
     action' ref
   %runWriter empty (\x y. combine x y) explicitAction
 
 def yield_accum
-      {a b w eff}
+      {a b w eff} [Data w]
       [mlift:MonoidLifter b w]
       (m:Monoid b)
-      (action: (h:Type ?-> AccumMonoid h b ?=> Ref h w -> {Accum h|eff} a))
+      (action: ((h:Heap) ?-> AccumMonoid h b ?=> Ref h w -> {Accum h|eff} a))
       : {|eff} w =
   snd $ run_accum m action
 
 def run_state
-      {a s eff}
+      {a s eff} [Data s]
       (init:s)
-      (action: h:Type ?-> Ref h s -> {State h |eff} a)
+      (action: (h:Heap) ?-> Ref h s -> {State h |eff} a)
       : {|eff} (a & s) =
-  def explicitAction (h':Type) (ref:Ref h' s) : {State h'|eff} a = action ref
+  def explicitAction (h':Heap) (ref:Ref h' s) : {State h'|eff} a = action ref
   %runState init explicitAction
 
 def with_state
-      {a s eff}
+      {a s eff} [Data s]
       (init:s)
-      (action: h:Type ?-> Ref h s -> {State h |eff} a)
+      (action: (h:Heap) ?-> Ref h s -> {State h |eff} a)
       : {|eff} a = fst $ run_state init action
 
 def yield_state
-      {a s eff}
+      {a s eff} [Data s]
       (init:s)
-      (action: h:Type ?-> Ref h s -> {State h |eff} a)
+      (action: (h:Heap) ?-> Ref h s -> {State h |eff} a)
       : {|eff} s = snd $ run_state init action
 
 def unsafe_io {a eff} (f: Unit -> {IO|eff} a) : {|eff} a =
-  %runIO f
+  f' : (Unit -> {IO|eff} a) = \_. f ()
+  %runIO f'
 
-def unreachable {a} (():Unit) : a = unsafe_io do
+def unreachable {a} [Data a] (():Unit) : a = unsafe_io do
   %throwError a
 
 '## Type classes
@@ -699,7 +760,7 @@ def unreachable {a} (():Unit) : a = unsafe_io do
 Equatable.
 Things that we can tell if they are equal or not to other things.
 
-interface Eq a
+interface [Data a] Eq a
   (==) : a -> a -> Bool
 
 def (/=) {a} [Eq a] (x:a) (y:a) : Bool = not $ x == y
@@ -745,6 +806,24 @@ instance Eq Bool
 instance Eq Unit
   (==) = \x y. True
 
+instance Eq (a | b) given {a b} [Eq a, Eq b]
+  (==) = \x y. case x of
+    Left x -> case y of
+      Left y -> x == y
+      Right y -> False
+    Right x -> case y of
+      Left y -> False
+      Right y -> x == y
+
+instance Eq (Maybe a) given {a} [Eq a]
+  (==) = \x y. case x of
+    Just x -> case y of
+      Just y -> x == y
+      Nothing -> False
+    Nothing -> case y of
+      Just y -> False
+      Nothing -> True
+
 instance Eq RawPtr
   (==) = \x y. raw_ptr_to_i64 x == raw_ptr_to_i64 y
 
@@ -780,32 +859,75 @@ instance Ord Unit
   (>) = \x y. False
   (<) = \x y. False
 
-instance {a b} [Eq a, Eq b] Eq (a & b)
+instance Eq (a & b) given {a b} [Eq a, Eq b]
   (==) = \(x1,x2) (y1,y2). x1 == y1 && x2 == y2
 
-instance {a b} [Ord a, Ord b] Ord (a & b)
+instance Ord (a & b) given {a b} [Ord a, Ord b]
   (>) = \(x1,x2) (y1,y2). x1 > y1 || (x1 == y1 && x2 > y2)
   (<) = \(x1,x2) (y1,y2). x1 < y1 || (x1 == y1 && x2 < y2)
 
 instance Eq Ordering
   (==) = \x y. o_to_w8 x == o_to_w8 y
 
+
+instance Eq Nat
+  (==) = \x y. nat_to_rep x == nat_to_rep y
+
+instance Ord Nat
+  (>) = \x y. nat_to_rep x > nat_to_rep y
+  (<) = \x y. nat_to_rep x < nat_to_rep y
+
 -- TODO: we want Eq and Ord for all index sets, not just `Fin n`
-instance {n} Eq (Fin n)
+instance Eq (Fin n) given {n}
   (==) = \x y. ordinal x == ordinal y
 
-instance {n} Ord (Fin n)
+instance Ord (Fin n) given {n}
   (>) = \x y. ordinal x > ordinal y
   (<) = \x y. ordinal x < ordinal y
 
-def scan {a b n} [Ix n] (init:a) (body:n->a->(a&b)) : (a & n=>b) =
+instance Ix Bool
+  size = 2
+  ordinal = \b. case b of
+    False -> 0
+    True -> 1
+  unsafe_from_ordinal = \i. i > 0
+
+instance Ix (Maybe a) given {a} [Ix a]
+  size = size a + 1
+  ordinal = \i. case i of
+    Just ai -> ordinal ai
+    Nothing -> size a
+  unsafe_from_ordinal = \o.
+    case o == size a of
+      False -> Just $ unsafe_from_ordinal _ o
+      True  -> Nothing
+
+instance NonEmpty Bool
+  first_ix = unsafe_from_ordinal _ 0
+
+instance NonEmpty (a & b) given {a b} [NonEmpty a, NonEmpty b]
+  first_ix = unsafe_from_ordinal _ 0
+
+instance NonEmpty (a|b) given {a b} [Ix b, NonEmpty a]
+  first_ix = unsafe_from_ordinal _ 0
+
+-- The below instance is valid, but causes "multiple candidate dictionaries"
+-- errors if both Left and Right are NonEmpty.
+-- instance NonEmpty (a|b) given {a b} [Ix a, NonEmpty b]
+--  first_ix = unsafe_from_ordinal _ 0
+
+instance NonEmpty (Maybe a) given {a} [Ix a]
+  first_ix = unsafe_from_ordinal _ 0
+
+def scan {a b n} [Ix n, Data a] (init:a) (body:n->a->(a&b)) : (a & n=>b) =
   swap $ run_state init \s. for i.
     c = get s
     (c', y) = body i c
     s := c'
     y
 
-def fold {a n} [Ix n] (init:a) (body:(n->a->a)) : a = fst $ scan init \i x. (body i x, ())
+def fold {a n} [Ix n, Data a] (init:a) (body:(n->a->a)) : a =
+  fst $ scan init \i x. (body i x, ())
 
 def compare {a} [Ord a] (x:a) (y:a) : Ordering =
   if x < y
@@ -822,12 +944,12 @@ instance Monoid Ordering
       GT -> GT
       EQ -> y
 
-instance {a n} [Eq a] Eq (n=>a)
+instance Eq (n=>a) given {a n} [Eq a]
   (==) = \xs ys.
     yield_accum AndMonoid \ref.
       for i. ref += xs.i == ys.i
 
-instance {a n} [Ord a] Ord (n=>a)
+instance Ord (n=>a) given {a n} [Ord a]
   (>) = \xs ys.
     f: Ordering =
         fold EQ $ \i c. c <> (compare xs.i ys.i)
@@ -837,32 +959,33 @@ instance {a n} [Ord a] Ord (n=>a)
         fold EQ $ \i c. c <> (compare xs.i ys.i)
     f == LT
 
-instance Ix Bool
-  size = 2
-  ordinal = \b. case b of
-    False -> 0
-    True -> 1
-  unsafe_from_ordinal = \i. i > 0
-
 '## Subset class
 
 interface Subset a_sub a
-  inject' : a_sub -> a
-  project' : a -> Maybe a_sub
+  inject'         : a_sub -> a
+  project'        : a -> Maybe a_sub
+  unsafe_project' : a -> a_sub
 
 def project {a} (a_sub:Type) [Subset a_sub a] (x:a) : Maybe a_sub =
   project' x
 
+def unsafe_project {a} (a_sub:Type) [Subset a_sub a] (x:a) : a_sub =
+  unsafe_project' x
+
 def inject {a_sub} (a:Type) [Subset a_sub a] (x:a_sub) : a =
   inject' x
 
-instance {a b c} [Subset a b, Subset b c] Subset a c
+instance Subset a c given {a b c} [Subset a b, Subset b c]
   inject' = \x. inject c $ inject b x
   project' = \x. case project b x of
     Nothing -> Nothing
     Just y -> project a y
+  unsafe_project' = \x. unsafe_project a $ unsafe_project b x
 
-instance {q:Type} {i:q} [Ix q] Subset (RangeFrom q i) q
+def unsafe_project_rangefrom {q:Type} {i:q} [Ix q] (j:q) : RangeFrom q i =
+  UnsafeMkRangeFrom $ unsafe_nat_diff (ordinal j) (ordinal i)
+
+instance Subset (RangeFrom q i) q given {q:Type} {i:q} [Ix q]
   inject' = \(UnsafeMkRangeFrom j).
     unsafe_from_ordinal _ $ j + ordinal i
   project' = \j.
@@ -871,8 +994,9 @@ instance {q:Type} {i:q} [Ix q] Subset (RangeFrom q i) q
     if j' < i'
       then Nothing
       else Just $ UnsafeMkRangeFrom $ unsafe_nat_diff j' i'
+  unsafe_project' = \j. UnsafeMkRangeFrom $ unsafe_nat_diff (ordinal j) (ordinal i)
 
-instance {q:Type} {i:q} [Ix q] Subset (RangeFromExc q i) q
+instance Subset (RangeFromExc q i) q given {q:Type} {i:q} [Ix q]
   inject' = \(UnsafeMkRangeFromExc j).
     unsafe_from_ordinal _ $ j + ordinal i + 1
   project' = \j.
@@ -881,8 +1005,10 @@ instance {q:Type} {i:q} [Ix q] Subset (RangeFromExc q i) q
     if j' <= i'
       then Nothing
       else Just $ UnsafeMkRangeFromExc $ unsafe_nat_diff j' (i' + 1)
+  unsafe_project' = \j.
+    UnsafeMkRangeFromExc $ unsafe_nat_diff (ordinal j) (ordinal i + 1)
 
-instance {q:Type} {i:q} [Ix q] Subset (RangeTo q i) q
+instance Subset (RangeTo q i) q given {q:Type} {i:q} [Ix q]
   inject' = \(UnsafeMkRangeTo j). unsafe_from_ordinal _ j
   project' = \j.
     j' = ordinal j
@@ -890,8 +1016,9 @@ instance {q:Type} {i:q} [Ix q] Subset (RangeTo q i) q
     if j' > i'
       then Nothing
       else Just $ UnsafeMkRangeTo j'
+  unsafe_project' = \j. UnsafeMkRangeTo (ordinal j)
 
-instance {q:Type} {i:q} [Ix q] Subset (RangeToExc q i) q
+instance Subset (RangeToExc q i) q given {q:Type} {i:q} [Ix q]
   inject' = \(UnsafeMkRangeToExc j). unsafe_from_ordinal _ j
   project' = \j.
     j' = ordinal j
@@ -899,8 +1026,9 @@ instance {q:Type} {i:q} [Ix q] Subset (RangeToExc q i) q
     if j' >= i'
       then Nothing
       else Just $ UnsafeMkRangeToExc j'
+  unsafe_project' = \j. UnsafeMkRangeToExc (ordinal j)
 
-instance {q:Type} {i:q} [Ix q] Subset (RangeToExc q i) (RangeTo q i)
+instance Subset (RangeToExc q i) (RangeTo q i) given {q:Type} {i:q} [Ix q]
   inject' = \(UnsafeMkRangeToExc j). unsafe_from_ordinal _ j
   project' = \j.
     j' = ordinal j
@@ -908,6 +1036,7 @@ instance {q:Type} {i:q} [Ix q] Subset (RangeToExc q i) (RangeTo q i)
     if j' >= i'
       then Nothing
       else Just $ UnsafeMkRangeToExc j'
+  unsafe_project' = \j. UnsafeMkRangeToExc (ordinal j)
 
 '## Elementary/Special Functions
 This is more or less the standard [LibM fare](https://en.wikipedia.org/wiki/C_mathematical_functions).
@@ -934,6 +1063,8 @@ interface Floating a
   sqrt   : a -> a
   pow    : a -> a -> a
   lgamma : a -> a
+  erf    : a -> a
+  erfc   : a -> a
 
 def lbeta {a} [Sub a, Floating a] : a -> a -> a = \x y. lgamma x + lgamma y - lgamma (x + y)
 
@@ -968,6 +1099,8 @@ instance Floating Float64
   sqrt   = \x. %sqrt   x
   pow    = \x y. %fpow x y
   lgamma = \x. %lgamma x
+  erf    = \x. %erf    x
+  erfc   = \x. %erfc   x
 
 instance Floating Float32
   exp    = \x. %exp x
@@ -988,6 +1121,8 @@ instance Floating Float32
   sqrt   = \x. %sqrt   x
   pow    = \x y. %fpow x y
   lgamma = \x. %lgamma x
+  erf    = \x. %erf    x
+  erfc   = \x. %erfc   x
 
 '## Raw pointer operations
 
@@ -997,7 +1132,7 @@ def cast_ptr {a b} (ptr: Ptr a) : Ptr b =
   (MkPtr rawPtr) = ptr
   MkPtr rawPtr
 
-interface Storable a
+interface [Data a] Storable a
   store : Ptr a -> a -> {IO} Unit
   load  : Ptr a ->      {IO} a
   storage_size a : Nat
@@ -1008,30 +1143,35 @@ instance Storable Word8
   storage_size = 1
 
 instance Storable Int32
-  store = \(MkPtr ptr) x. %ptrStore (internal_cast %Int32Ptr ptr) x
-  load  = \(MkPtr ptr)  . %ptrLoad  (internal_cast %Int32Ptr ptr)
+  store = \(MkPtr ptr) x. %ptrStore (internal_cast (%Int32Ptr) ptr) x
+  load  = \(MkPtr ptr)  . %ptrLoad  (internal_cast (%Int32Ptr) ptr)
   storage_size = 4
 
 instance Storable Word32
-  store = \(MkPtr ptr) x. %ptrStore (internal_cast %Word32Ptr ptr) x
-  load  = \(MkPtr ptr)  . %ptrLoad  (internal_cast %Word32Ptr ptr)
+  store = \(MkPtr ptr) x. %ptrStore (internal_cast (%Word32Ptr) ptr) x
+  load  = \(MkPtr ptr)  . %ptrLoad  (internal_cast (%Word32Ptr) ptr)
   storage_size = 4
 
 instance Storable Float32
-  store = \(MkPtr ptr) x. %ptrStore (internal_cast %Float32Ptr ptr) x
-  load = \(MkPtr ptr)   . %ptrLoad  (internal_cast %Float32Ptr ptr)
+  store = \(MkPtr ptr) x. %ptrStore (internal_cast (%Float32Ptr) ptr) x
+  load = \(MkPtr ptr)   . %ptrLoad  (internal_cast (%Float32Ptr) ptr)
   storage_size = 4
 
-instance {a} Storable (Ptr a)
-  store = \(MkPtr ptr) (MkPtr x).         %ptrStore (internal_cast %PtrPtr ptr) x
-  load  = \(MkPtr ptr)          . MkPtr $ %ptrLoad  (internal_cast %PtrPtr ptr)
+instance Storable Nat
+  store = \(MkPtr ptr) x. store (MkPtr ptr) $ nat_to_rep x
+  load  = \(MkPtr ptr)  . rep_to_nat $ load (MkPtr ptr)
+  storage_size = storage_size NatRep
+
+instance Storable (Ptr a) given {a}
+  store = \(MkPtr ptr) (MkPtr x).         %ptrStore (internal_cast (%PtrPtr) ptr) x
+  load  = \(MkPtr ptr)          . MkPtr $ %ptrLoad  (internal_cast (%PtrPtr) ptr)
   storage_size = 8  -- TODO: something more portable?
 
 -- TODO: Storable instances for other types
 
 def malloc {a} [Storable a] (n:Nat) : {IO} (Ptr a) =
   numBytes = storage_size a * n
-  MkPtr $ %alloc numBytes
+  MkPtr $ %alloc (nat_to_rep numBytes)
 
 def free {a} (ptr:Ptr a) : {IO} Unit =
   (MkPtr ptr') = ptr
@@ -1039,7 +1179,7 @@ def free {a} (ptr:Ptr a) : {IO} Unit =
 
 def (+>>) {a} [Storable a] (ptr:Ptr a) (i:Nat) : Ptr a =
   (MkPtr ptr') = ptr
-  i' = i * storage_size a
+  i' = nat_to_rep $ i * storage_size a
   MkPtr $ %ptrOffset ptr' i'
 
 -- TODO: consider making a Storable instance for tables instead
@@ -1060,9 +1200,9 @@ def with_alloc {a b} [Storable a] (n:Nat) (action: Ptr a -> {IO} b) : {IO} b =
   result
 
 def with_table_ptr {a b n} [Storable a] (xs:n=>a) (action : Ptr a -> {IO} b) : {IO} b =
-  with_alloc (size n) \ptr.
-    for i. store (ptr +>> ordinal i) xs.i
-    action ptr
+  ptr <- with_alloc (size n)
+  for i. store (ptr +>> ordinal i) xs.i
+  action ptr
 
 def table_from_ptr {a} [Storable a] (n:Type) [Ix n] (ptr:Ptr a) : {IO} n=>a =
   for i. load $ ptr +>> ordinal i
@@ -1074,16 +1214,16 @@ pi : Float = 3.141592653589793
 def id {a} (x:a) : a = x
 def dup {a} (x:a) : (a & a) = (x, x)
 def map {a b n eff} (f:a->{|eff} b) (xs: n=>a) : {|eff} (n=>b) = for i. f xs.i
-def zip {a b n} (xs:n=>a) (ys:n=>b) : (n=>(a&b)) = view i. (xs.i, ys.i)
+def zip {a b n} (xs:n=>a) (ys:n=>b) : (n=>(a&b)) = for i. (xs.i, ys.i)
 def unzip {a b n} (xys:n=>(a&b)) : (n=>a & n=>b) = (map fst xys, map snd xys)
-def fanout {a} (n:Type) [Ix n] (x:a) : n=>a = view i. x
+def fanout {a} (n:Type) [Ix n] (x:a) : n=>a = for i. x
 def sq  {a} [Mul a] (x:a) : a = x * x
 def abs {a} [Sub a, Ord a] (x:a) : a = select (x > zero) x (zero - x)
 def mod {a} [Add a, Integral a] (x:a) (y:a) : a = rem (y + rem x y) y
 
 '## Table Operations
 
-instance {a n} [Floating a] Floating (n=>a)
+instance Floating (n=>a) given {a n} [Floating a]
   exp    = map exp
   exp2   = map exp2
   log    = map log
@@ -1102,6 +1242,8 @@ instance {a n} [Floating a] Floating (n=>a)
   sqrt   = map sqrt
   pow    = \x y. for i. pow x.i y.i
   lgamma = map lgamma
+  erf    = map erf
+  erfc   = map erfc
 
 '### Axis Restructuring
 
@@ -1113,12 +1255,13 @@ def reindex {a b v} [Ix b] (ixr: b -> a) (tab: a=>v) : b=>v = for i. tab.(ixr i)
 
 -- `combine` should be a commutative and associative, and form a
 -- commutative monoid with `identity`
-def reduce {a n} (identity:a) (combine:(a->a->a)) (xs:n=>a) : a =
+def reduce {a n} [Data a] (identity:a) (combine:(a->a->a)) (xs:n=>a) : a =
   -- TODO: implement with the accumulator effect
   fold identity (\i c. combine c xs.i)
 
 -- TODO: call this `scan` and call the current `scan` something else
-def scan' {a n} [Ix n] (init:a) (body:n->a->a) : n=>a = snd $ scan init \i x. dup (body i x)
+def scan' {a n} [Ix n, Data a] (init:a) (body:n->a->a) : n=>a =
+  snd $ scan init \i x. dup (body i x)
 -- TODO: allow tables-via-lambda and get rid of this
 def fsum {n} (xs:n=>Float) : Float = yield_accum (AddMonoid Float) \ref. for i. ref += xs.i
 def sum  {n v} [Add v] (xs:n=>v) : v = reduce zero (+) xs
@@ -1130,7 +1273,7 @@ def all {n} (xs:n=>Bool) : Bool = reduce True  (&&) xs
 
 '### apply_n
 
-def apply_n {a} (n:Nat) (x:a) (f:a -> a) : a =
+def apply_n {a} [Data a] (n:Nat) (x:a) (f:a -> a) : a =
   yield_state x \ref. for _:(Fin n).
     ref := f (get ref)
 
@@ -1140,20 +1283,20 @@ def linspace (n:Type) [Ix n] (low:Float) (high:Float) : n=>Float =
   dx = (high - low) / n_to_f (size n)
   for i:n. low + n_to_f (ordinal i) * dx
 
-def transpose {n m a} (x:n=>m=>a) : m=>n=>a = view i j. x.j.i
-def vdot {n} (x:n=>Float) (y:n=>Float) : Float = fsum view i. x.i * y.i
+def transpose {n m a} (x:n=>m=>a) : m=>n=>a = for i j. x.j.i
+def vdot {n} (x:n=>Float) (y:n=>Float) : Float = fsum for i. x.i * y.i
 def dot {n v} [VSpace v] (s:n=>Float) (vs:n=>v) : v = sum for j. s.j .* vs.j
 
 -- matmul. Better symbol to use? `@`?
 -- TODO: Improve auto-quantification to hoist the Ix n constraint to the type binder
 def (**) {l m n} [Ix n] (x: l=>m=>Float) (y: m=>n=>Float) : (l=>n=>Float) =
-  for i k. fsum view j. x.i.j * y.j.k
+  for i k. fsum for j. x.i.j * y.j.k
 
 def (**.) {n m} (mat: n=>m=>Float) (v: m=>Float) : (n=>Float) = for i. vdot mat.i v
 def (.**) {n m} (v: m=>Float) (mat: n=>m=>Float) : (n=>Float) = mat **. v
 
 def inner {n m} (x:n=>Float) (mat:n=>m=>Float) (y:m=>Float) : Float =
-  fsum view (i,j). x.i * mat.i.j * y.j
+  fsum for (i,j). x.i * mat.i.j * y.j
 
 def eye {n a} [Add a, Mul a, Ix n] : n=>n=>a =
   for i j. select (ordinal i == ordinal j) one zero
@@ -1163,29 +1306,29 @@ TODO: Move this to be with reductions?
 It's a kind of `scan`.
 
 def cumsum {n a} [Add a] (xs: n=>a) : n=>a =
-  with_state zero \total.
-    for i.
-      newTotal = get total + xs.i
-      total := newTotal
-      newTotal
+  total <- with_state zero
+  for i.
+    newTotal = get total + xs.i
+    total := newTotal
+    newTotal
 
 def cumsum_low {n a} [Add a] (xs: n=>a) : n=>a =
-  with_state zero \total.
-    for i.
-      oldTotal = get total
-      total := oldTotal + xs.i
-      oldTotal
+  total <- with_state zero
+  for i.
+    oldTotal = get total
+    total := oldTotal + xs.i
+    oldTotal
 
 '## Automatic differentiation
 
 '### AD operations
 
 -- TODO: add vector space constraints
-def linearize {a b} (f:a->b) (x:a) : (b & a --o b) = %linearize (\x. f x) x
+def linearize {a b} (f:a->b) (x:a) : (b & a --o b) = (%linearize (\x. f x) x)
 def jvp {a b} (f:a->b) (x:a) : a --o b = snd (linearize f x)
-def transpose_linear {a b} (f:a --o b) : b --o a =
+def transpose_linear {a b} (f:a --o b) : b --o a = \ct.
   f' : a --o b = \x. f x
-  %linearTranspose f'
+  %linearTranspose f' ct
 
 def vjp {a b} (f:a->b) (x:a) : (b & b --o a) =
   (y, df) = linearize f x
@@ -1235,19 +1378,19 @@ instance HasDefaultTolerance Float64
   atol = f_to_f64 0.00000001
   rtol = f_to_f64 0.00001
 
-instance {a b} [HasDefaultTolerance a, HasDefaultTolerance b,
-                HasAllClose a, HasAllClose b] HasAllClose (a & b)
+instance HasAllClose (a & b) given {a b} [ HasDefaultTolerance a, HasDefaultTolerance b
+                                         , HasAllClose a, HasAllClose b] 
   allclose = \atol rtol (a, b) (c, d). (a ~~ c) && (b ~~ d)
 
-instance {a b} [HasDefaultTolerance a, HasDefaultTolerance b] HasDefaultTolerance (a & b)
+instance HasDefaultTolerance (a & b) given {a b} [HasDefaultTolerance a, HasDefaultTolerance b]
   atol = (atol, atol)
   rtol = (rtol, rtol)
 
-instance {n t} [HasAllClose t] HasAllClose (n=>t)
+instance HasAllClose (n=>t) given {n t} [HasAllClose t]
   allclose = \atol rtol a b.
     all for i:n. allclose atol.i rtol.i a.i b.i
 
-instance {n t} [HasDefaultTolerance t] HasDefaultTolerance (n=>t)
+instance HasDefaultTolerance (n=>t) given {n t} [HasDefaultTolerance t]
   atol = for i. atol
   rtol = for i. rtol
 
@@ -1268,7 +1411,7 @@ def check_deriv (f:Float->Float) (x:Float) : Bool =
 data List a =
   AsList n:Nat elements:(Fin n => a)
 
-instance {a} [Eq a] Eq (List a)
+instance Eq (List a) given {a} [Eq a]
   (==) = \(AsList nx xs) (AsList ny ys).
     if nx /= ny
       then False
@@ -1282,7 +1425,7 @@ def to_list {n a} (xs:n=>a) : List a =
   n' = size n
   AsList _ $ unsafe_cast_table (Fin n') xs
 
-instance {a} Monoid (List a)
+instance Monoid (List a) given {a} [Data a]
   mempty = AsList _ []
   mcombine = \x y.
     (AsList nx xs) = x
@@ -1294,107 +1437,15 @@ instance {a} Monoid (List a)
         True  -> xs.(unsafe_from_ordinal _ i')
         False -> ys.(unsafe_from_ordinal _ $ unsafe_nat_diff i' nx)
 
-named-instance ListMonoid : (a:Type) Monoid (List a)
+named-instance ListMonoid : Monoid (List a) given (a:Type) [Data a]
   mempty = mempty
   mcombine = mcombine
 
 -- TODO Eliminate or reimplement this operation, since it costs O(n)
 -- where n is the length of the list held in the reference.
-def append {a h} [AccumMonoid h (List a)]
+def append {a h} [AccumMonoid h (List a), Data a]
   (list: Ref h (List a)) (x:a) : {Accum h} Unit =
     list += AsList _ [x]
-
-'## Isomorphisms
-
-data Iso a b = MkIso { fwd: a -> b & bwd: b -> a }
-
-def app_iso {a b} (iso: Iso a b) (x:a) : b =
-  (MkIso {fwd, bwd}) = iso
-  fwd x
-
-def flip_iso {a b} (iso: Iso a b) : Iso b a =
-  (MkIso {fwd, bwd}) = iso
-  MkIso {fwd=bwd, bwd=fwd}
-
-def rev_iso {a b} (iso: Iso a b) (x:b) : a = app_iso (flip_iso iso) x
-
-def id_iso {a} : Iso a a = MkIso {fwd=id, bwd=id}
-
-def (&>>) {a b c} (iso1: Iso a b) (iso2: Iso b c) : Iso a c =
-  (MkIso {fwd=fwd1, bwd=bwd1}) = iso1
-  (MkIso {fwd=fwd2, bwd=bwd2}) = iso2
-  MkIso {fwd=(fwd1 >>> fwd2), bwd=(bwd1 <<< bwd2)}
-
-def (<<&) {a b c} (iso2: Iso b c) (iso1: Iso a b) : Iso a c = iso1 &>> iso2
-
-'### Lens-like accessors
-note: `#foo is an Iso {foo: a & ...b} (a & {&...b}))`
-
-def get_at  {a b c} (iso: Iso a (b & c)) : a -> b = fst <<< app_iso iso
-def pop_at  {a b c} (iso: Iso a (b & c)) : a -> c = snd <<< app_iso iso
-def push_at {a b c} (iso: Iso a (b & c)) (x:b) (r:c) : a = rev_iso iso (x, r)
-def set_at  {a b c} (iso: Iso a (b & c)) (x:b) (r:a) : a =
-  push_at iso x $ pop_at iso r
-
-'### Prism-like accessors
-note: `#?foo is an Iso {foo: a | ...b} (a | {|...b}))`
-
-def match_with {a b c} (iso: Iso a (b | c)) (x: a) : Maybe b =
-  case app_iso iso x of
-    Left x -> Just x
-    Right _ -> Nothing
-def build_with {a b c} (iso: Iso a (b | c)) (x: b) : a = rev_iso iso $ Left x
-
-def swap_pair_iso {a b} : Iso (a & b) (b & a) =
-  MkIso {fwd = \(a, b). (b, a), bwd = \(b, a). (a, b)}
-
-'### Complement lens
-Complement the focus of a lens-like isomorphism
-
-def except_lens {a b c} (iso: Iso a (b & c)) : Iso a (c & b) = iso &>> swap_pair_iso
-
-def swap_either_iso {a b} : Iso (a | b) (b | a) =
-  fwd = \x. case x of
-    Left l -> Right l
-    Right r -> Left r
-  bwd = \x. case x of
-    Left r -> Right r
-    Right l -> Left l
-  MkIso {fwd, bwd}
-
-'### Complement prism
-Complement the focus of a prism-like isomorphism
-
-def except_prism {a b c} : Iso a (b | c) -> Iso a (c | b) = \iso. iso &>> swap_either_iso
-
--- Use a lens-like iso to split a 1d table into a 2d table
-def over_lens {a b c v} [Ix b, Ix c] (iso: Iso a (b & c)) (tab: a=>v) : (b=>c=>v) =
-  for i j. tab.(rev_iso iso (i, j))
-
-'### Zipper
-Zipper isomorphisms to easily specify many record/variant fields:
-```
-#&foo is an Iso ({&...l} & {foo:a & ...r}) ({foo:a & ...l} & {&...r})
-#|foo is an Iso ({|...l} | {foo:a | ...r}) ({foo:a | ...l} | {|...r})
-```
-
-' Convert a record zipper isomorphism to a normal lens-like isomorphism
-by using `splitR &>> iso`
-
-def split_r {a} : Iso a ({&} & a) = MkIso {fwd=\x. ({}, x), bwd=\({}, x). x}
-
-def over_fields {a b c v} [Ix b, Ix c]
-      (iso: Iso ({&} & a) (b & c)) (tab: a=>v) : b=>c=>v =
-  over_lens (split_r &>> iso) tab
-
-'Convert a variant zipper isomorphism to a normal prism-like isomorphism
-by using `splitV &>> iso`
-
-def split_v {a} : Iso a ({|} | a) =
-  MkIso {fwd=\x. Right x, bwd=\v. case v of Right x -> x}
-
-def slice_fields {a b c v} [Ix b] (iso: Iso ({|} | a) (b | c)) (tab: a=>v) : b=>v =
-  reindex (build_with $ split_v &>> iso) tab
 
 -- TODO: replace `slice` with this?
 def post_slice {a n} (xs:n=>a) (start:Post n) (end:Post n) : List a =
@@ -1402,43 +1453,40 @@ def post_slice {a n} (xs:n=>a) (start:Post n) (end:Post n) : List a =
   to_list for i:(Fin slice_size).
     xs.(unsafe_from_ordinal n (ordinal i + ordinal start))
 
-'## Dynamic buffer
+-- '## Dynamic buffer
 
--- TODO: would be nice to be able to use records here
-data DynBuffer a =
-  MkDynBuffer {
-      size    : Ptr Nat
-    & maxSize : Ptr Nat
-    & buffer  : Ptr (Ptr a) }
+struct DynBuffer a =
+  size    : Ptr Nat
+  max_size : Ptr Nat
+  buffer  : Ptr (Ptr a)
 
 def with_dynamic_buffer {a b} [Storable a]
       (action: DynBuffer a -> {IO} b) : {IO} b =
   initMaxSize = 256
-  with_alloc 1 \sizePtr. with_alloc 1 \maxSizePtr. with_alloc 1 \bufferPtr.
-    store sizePtr 0
-    store maxSizePtr initMaxSize
-    store bufferPtr $ malloc initMaxSize
-    result = action $ MkDynBuffer {
-        size    = sizePtr
-      , maxSize = maxSizePtr
-      , buffer  = bufferPtr }
-    free $ load bufferPtr
-    result
+  sizePtr <- with_alloc 1
+  store sizePtr 0
+  maxSizePtr <- with_alloc 1
+  store maxSizePtr initMaxSize
+  bufferPtr <- with_alloc 1
+  store bufferPtr $ malloc initMaxSize
+  result = action $ DynBuffer~new sizePtr maxSizePtr bufferPtr
+  free $ load bufferPtr
+  result
 
 def maybe_increase_buffer_size {a} [Storable a]
-      ((MkDynBuffer db): DynBuffer a) (sizeDelta:Nat) : {IO} Unit =
-  size    = load $ get_at #size    db
-  maxSize = load $ get_at #maxSize db
-  bufPtr  = load $ get_at #buffer  db
+      (db : DynBuffer a) (sizeDelta:Nat) : {IO} Unit =
+  size     = load db~size
+  max_size = load db~max_size
+  bufPtr   = load db~buffer
   newSize = sizeDelta + size
-  if newSize > maxSize then
+  if newSize > max_size then
     -- TODO: maybe this should use integer arithmetic?
     newMaxSize = f_to_n $ pow 2.0 (ceil $ log2 $ n_to_f newSize)
     newBufPtr = malloc newMaxSize
     memcpy newBufPtr bufPtr size
     free bufPtr
-    store (get_at #maxSize db) newMaxSize
-    store (get_at #buffer  db) newBufPtr
+    store db~max_size newMaxSize
+    store db~buffer   newBufPtr
 
 def add_at_nat_ptr (ptr: Ptr Nat) (n:Nat) : {IO} Unit =
   store ptr (load ptr + n)
@@ -1447,17 +1495,15 @@ def extend_dynamic_buffer {a} [Storable a]
       (buf: DynBuffer a) (new:List a) : {IO} Unit =
   (AsList n xs) = new
   maybe_increase_buffer_size buf n
-  (MkDynBuffer db) = buf
-  bufPtr = load $ get_at #buffer db
-  size   = load $ get_at #size db
+  bufPtr = load buf~buffer
+  size   = load buf~size
   store_table (bufPtr +>> size) xs
-  add_at_nat_ptr (get_at #size db) n
+  add_at_nat_ptr buf~size n
 
 def load_dynamic_buffer {a} [Storable a]
       (buf: DynBuffer a) : {IO} (List a) =
-  (MkDynBuffer db) = buf
-  bufPtr = load $ get_at #buffer db
-  size   = load $ get_at #size db
+  bufPtr = load buf~buffer
+  size   = load buf~size
   AsList size $ table_from_ptr _ bufPtr
 
 def push_dynamic_buffer {a} [Storable a]
@@ -1468,8 +1514,8 @@ def push_dynamic_buffer {a} [Storable a]
 
 String : Type = List Char
 
-def string_from_char_ptr (n:Nat) (ptr:Ptr Char) : {IO} String =
-  AsList n $ table_from_ptr _ ptr
+def string_from_char_ptr (n:Word32) (ptr:Ptr Char) : {IO} String =
+  AsList (rep_to_nat n) $ table_from_ptr _ ptr
 
 -- TODO. This is ASCII code point. It really should be Int32 for Unicode codepoint
 def codepoint (c:Char) : Int = w8_to_i c
@@ -1493,42 +1539,38 @@ interface Show a
 instance Show String
   show = id
 
-foreign "showNat32" showNat32 : Nat -> {IO} (Nat & RawPtr)
-
-instance Show Nat
-  show = \x. unsafe_io do
-    (n, ptr) = showNat32 x
-    string_from_char_ptr n $ MkPtr ptr
-
-foreign "showInt32" showInt32 : Int32 -> {IO} (Nat & RawPtr)
+foreign "showInt32" showInt32 : Int32 -> {IO} (Word32 & RawPtr)
 
 instance Show Int32
   show = \x. unsafe_io do
     (n, ptr) = showInt32 x
     string_from_char_ptr n $ MkPtr ptr
 
-foreign "showInt64" showInt64 : Int64 -> {IO} (Nat & RawPtr)
+foreign "showInt64" showInt64 : Int64 -> {IO} (Word32 & RawPtr)
 
 instance Show Int64
   show = \x. unsafe_io do
     (n, ptr) = showInt64 x
     string_from_char_ptr n $ MkPtr ptr
 
-foreign "showFloat32" showFloat32 : Float32 -> {IO} (Nat & RawPtr)
+instance Show Nat
+  show = \x. show $ n_to_i64 x
+
+foreign "showFloat32" showFloat32 : Float32 -> {IO} (Word32 & RawPtr)
 
 instance Show Float32
   show = \x. unsafe_io do
     (n, ptr) = showFloat32 x
     string_from_char_ptr n $ MkPtr ptr
 
-foreign "showFloat64" showFloat64 : Float64 -> {IO} (Nat & RawPtr)
+foreign "showFloat64" showFloat64 : Float64 -> {IO} (Word32 & RawPtr)
 
 instance Show Float64
   show = \x. unsafe_io do
     (n, ptr) = showFloat64 x
     string_from_char_ptr n $ MkPtr ptr
 
-instance {a b} [Show a, Show b] Show (a & b)
+instance Show (a & b) given {a b} [Show a, Show b]
   show = \(a, b). "(" <> show a <> ", " <> show b <> ")"
 
 '### Parse interface
@@ -1587,10 +1629,11 @@ def either_is_nan (x:Float) (y:Float) : Bool = (isnan x) || (isnan y)
 
 FilePath : Type = String
 
-def null_raw_ptr : RawPtr = i64_to_raw_ptr $ i_to_i64 0
+def is_null_raw_ptr (ptr:RawPtr) : Bool =
+  raw_ptr_to_i64 ptr == 0
 
 def from_nullable_raw_ptr {a} (ptr:RawPtr) : Maybe (Ptr a) =
-  if ptr == null_raw_ptr
+  if is_null_raw_ptr ptr
     then Nothing
     else Just $ MkPtr ptr
 
@@ -1640,7 +1683,7 @@ def while {eff} (body: Unit -> {|eff} Bool) : {|eff} Unit =
   body' : Unit -> {|eff} Word8 = \_. b_to_w8 $ body ()
   %while body'
 
-data IterResult a =
+data IterResult a [Data a] =
   Continue
   Done a
 
@@ -1650,7 +1693,8 @@ def lift_state {a b c h eff} (ref: Ref h c) (f:a -> {|eff} b) (x:a) : {State h|e
 
 -- A little iteration combinator
 def iter {a eff} (body: Nat -> {|eff} IterResult a) : {|eff} a  =
-  result = yield_state Nothing \resultRef. with_state 0 \i.
+  result = yield_state Nothing \resultRef.
+    i <- with_state 0
     while do
       continue = is_nothing $ get resultRef
       if continue then
@@ -1699,22 +1743,23 @@ def fread (stream:Stream ReadMode) : {IO} String =
   (MkStream stream') = stream
   -- TODO: allow reading longer files!
   n = 4096
-  with_alloc n \ptr:(Ptr Char).
-    with_dynamic_buffer \buf.
-      iter \_.
-        (MkPtr rawPtr) = ptr
-        numRead = i64_to_n $ freadFFI rawPtr (i_to_i64 1) (n_to_i64 n) stream'
-        extend_dynamic_buffer buf $ string_from_char_ptr numRead ptr
-        if numRead == n
-          then Continue
-          else Done ()
-      load_dynamic_buffer buf
+  ptr:(Ptr Char) <- with_alloc n
+  buf <- with_dynamic_buffer
+  iter \_.
+    (MkPtr rawPtr) = ptr
+    numRead = i_to_w32 $ i64_to_i $ freadFFI rawPtr (i_to_i64 1) (n_to_i64 n) stream'
+    extend_dynamic_buffer buf $ string_from_char_ptr numRead ptr
+    if numRead == n_to_w32 n
+      then Continue
+      else Done ()
+  load_dynamic_buffer buf
 
 '### Print
 
 def get_output_stream (_:Unit) : {IO} Stream WriteMode =
-  MkStream $ %ptrLoad %outputStreamPtr
+  MkStream $ %outputStream
 
+@noinline
 def print (s:String) : {IO} Unit =
   stream = get_output_stream ()
   fwrite stream s
@@ -1741,11 +1786,12 @@ Not to be confused with a partially applied function
 
 '### Error throwing
 
-def error {a} (s:String) : a = unsafe_io do
+@noinline
+def error {a} [Data a] (s:String) : a = unsafe_io do
   print s
   %throwError a
 
-def todo {a} : a = error "TODO: implement it!"
+def todo {a} [Data a] : a = error "TODO: implement it!"
 
 '### File Operations
 
@@ -1754,13 +1800,13 @@ def delete_file (f:FilePath) : {IO} Unit =
     removeFFI ptr
   ()
 
-def with_file {a}
+def with_file {a} [Data a]
       (f:FilePath) (mode:StreamMode)
       (action: Stream mode -> {IO} a)
       : {IO} a =
   stream = fopen f mode
   (MkStream stream') = stream
-  if stream' == null_raw_ptr
+  if is_null_raw_ptr stream'
     then
       error $ "Unable to open file: " <> f
     else
@@ -1777,7 +1823,7 @@ def read_file (f:FilePath) : {IO} String =
 def has_file (f:FilePath) : {IO} Bool =
   stream = fopen f ReadMode
   (MkStream stream') = stream
-  result = stream' /= null_raw_ptr
+  result = not (is_null_raw_ptr stream')
   if result then fclose stream
   result
 
@@ -1808,13 +1854,19 @@ def from_ordinal_error (i:Nat) (upper:Nat) : String =
   "Ordinal index out of range:" <> show i <> " >= " <> show upper
 
 def from_ordinal (n:Type) [Ix n] (i:Nat) : n =
-  case (0 <= i) && (i < size n) of
+  case i < size n of
     True  -> unsafe_from_ordinal _ i
     False -> error $ from_ordinal_error i $ size n
 
+-- TODO: should this be called `from_ordinal`?
+def to_ix (n:Type) [Ix n] (i:Nat) : Maybe n =
+  case i < size n of
+    True  -> Just $ unsafe_from_ordinal _ i
+    False -> Nothing
+
 -- TODO: could make an `unsafeCastIndex` and this could avoid the runtime copy
 -- TODO: safe (runtime-checked) and unsafe versions
-def cast_table {n a} (m:Type) [Ix m] (xs:n=>a) : m=>a =
+def cast_table {n a} (m:Type) [Ix m, Data a] (xs:n=>a) : m=>a =
   case size m == size n of
      True  -> unsafe_cast_table _ xs
      False -> error $
@@ -1882,30 +1934,34 @@ def hash (x:Key) (y:Nat) : Key =
 def new_key (x:Nat) : Key = hash (n_to_w64 0) x
 def many {a n} [Ix n] (f:Key->a) (k:Key) (i:n) : a = f (hash k (ordinal i))
 def ixkey {n} (k:Key) (i:n) [Ix n] : Key = hash k (ordinal i)
-def ixkey2 {n m} (k:Key) (i:n) (j:m) [Ix n, Ix m] : Key = hash (hash k (ordinal i)) (ordinal j)
 def split_key {n} (k:Key) : Fin n => Key = for i. ixkey k i
 
 '### Sample Generators
 These functions generate samples taken from, different distributions.
-Such as `rand_mat` with samples from the distribution of floating point matrices where each element is taken from a i.i.d. uniform distribution.
+Such as `rand_mat` with samples from the distribution of floating point matrices where each element is taken from a i.i.d. uniform distribution. Note that additional standard distributions are provided by the `stats` library.
 
-foreign "randunif" randunifFFI : Word64 -> {IO} Float64
+def rand (k:Key) : Float =
+  exponent_bits = 1065353216 -- 1065353216 = 127 << 23
+  mantissa_bits = (high_word k .&. 8388607)  -- 8388607 == (1 << 23) - 1
+  bits = exponent_bits .|. mantissa_bits
+  (%bitcast Float bits) - 1.0
 
-def rand (k:Key) : Float =  unsafe_io do f64_to_f $ randunifFFI k
 def rand_vec {a} (n:Nat) (f: Key -> a) (k: Key) : Fin n => a =
   for i:(Fin n). f (ixkey k i)
 
 def rand_mat {a} (n:Nat) (m:Nat) (f: Key -> a) (k: Key) : Fin n => Fin m => a =
-  for i j. f (ixkey2 k i j)
+  for i j. f (ixkey k (i, j))
 
 def randn (k:Key) : Float =
   [k1, k2] = split_key k
-  u1 = rand k1
+  -- rand is uniform between 0 and 1, but implemented such that it rounds to 0
+  -- (in float32) once every few million draws, but never rounds to 1.
+  u1 = 1.0 - (rand k1)
   u2 = rand k2
   sqrt ((-2.0) * log u1) * cos (2.0 * pi * u2)
 
 -- TODO: Make this better...
-def rand_int (k:Key) : Nat = (internal_cast Nat k) `mod` 2147483647
+def rand_int (k:Key) : Nat = w64_to_n k `mod` 2147483647
 
 def bern (p:Float) (k:Key) : Bool = rand k < p
 
@@ -1924,7 +1980,7 @@ interface [VSpace v] InnerProd v
 instance InnerProd Float
   inner_prod = \x y. x * y
 
-instance {a n} [InnerProd a] InnerProd (n=>a)
+instance InnerProd (n=>a) given {a n} [InnerProd a]
   inner_prod = \x y. sum for i. inner_prod x.i y.i
 
 
@@ -1935,7 +1991,7 @@ interface Arbitrary a
   arb : Key -> a
 
 instance Arbitrary Bool
-  arb = \key. rand key < 0.5
+  arb = \key. key .&. 1 == 0
 
 instance Arbitrary Float32
   arb = randn
@@ -1943,30 +1999,30 @@ instance Arbitrary Float32
 instance Arbitrary Int32
   arb = \key. f_to_i $ randn key * 5.0
 
-instance Arbitrary Word32
+instance Arbitrary Nat
   arb = \key. f_to_n $ randn key * 5.0
 
-instance {n a} [Arbitrary a] Arbitrary (n=>a)
+instance Arbitrary (n=>a) given {n a} [Arbitrary a]
   arb = \key. for i. arb $ ixkey key i
 
-instance {n a} [Arbitrary a] Arbitrary (i:n=>(..<i) => a)
+instance Arbitrary ((i:n)=>(..<i) => a) given {n a} [Arbitrary a]
   arb = \x. for i. arb $ new_key (ordinal i)
 
-instance {n a} [Arbitrary a] Arbitrary (i:n=>(..i) => a)
+instance Arbitrary ((i:n)=>(..i) => a) given {n a} [Arbitrary a]
   arb = \x. for i. arb $ new_key (ordinal i)
 
-instance {n a} [Arbitrary a] Arbitrary (i:n=>(i..) => a)
+instance Arbitrary ((i:n)=>(i..) => a) given {n a} [Arbitrary a]
   arb = \x. for i. arb $ new_key (ordinal i)
 
-instance {n a} [Arbitrary a] Arbitrary (i:n=>(i<..) => a)
+instance Arbitrary ((i:n)=>(i<..) => a) given {n a} [Arbitrary a]
   arb = \x. for i. arb $ new_key (ordinal i)
 
-instance {a b} [Arbitrary a, Arbitrary b] Arbitrary (a & b)
+instance Arbitrary (a & b) given {a b} [Arbitrary a, Arbitrary b]
   arb = \key.
     [k1, k2] = split_key key
     (arb k1, arb k2)
 
-instance {n} Arbitrary (Fin n)
+instance Arbitrary (Fin n) given {n}
   arb = rand_idx
 
 '## Ord on Arrays
@@ -1999,9 +2055,9 @@ def max_by {a o} [Ord o] (f:a->o) (x:a) (y:a) : a = select (f x > f y) x y
 def min {o} [Ord o] (x1: o) (x2: o) : o = min_by id x1 x2
 def max {o} [Ord o] (x1: o) (x2: o) : o = max_by id x1 x2
 
-def minimum_by {a n o} [Ord o] (f:a->o) (xs:n=>a) : a =
+def minimum_by {a n o} [Data a, Ord o] (f:a->o) (xs:n=>a) : a =
   reduce xs.(0@_) (min_by f) xs
-def maximum_by {a n o} [Ord o] (f:a->o) (xs:n=>a) : a =
+def maximum_by {a n o} [Data a, Ord o] (f:a->o) (xs:n=>a) : a =
   reduce xs.(0@_) (max_by f) xs
 
 def minimum {n o} [Ord o] (xs:n=>o) : o = minimum_by id xs
@@ -2010,7 +2066,7 @@ def maximum {n o} [Ord o] (xs:n=>o) : o = maximum_by id xs
 '### argmin/argmax
 TODO: put in same section as `searchsorted`
 
-def argscan {n o} (comp:o->o->Bool) (xs:n=>o) : n =
+def argscan {n o} [Data o] (comp:o->o->Bool) (xs:n=>o) : n =
   zeroth = (0@_, xs.(0@_))
   compare = \(idx1, x1) (idx2, x2).
     select (comp x1 x2) (idx1, x1) (idx2, x2)
@@ -2048,7 +2104,7 @@ def lexical_order {n} [Ord n]
             True -> Continue
             False -> Done False
 
-instance {n} [Ord n] Ord (List n)
+instance Ord (List n) given {n} [Ord n]
   (>) = lexical_order (>) (>)
   (<) = lexical_order (<) (<)
 
@@ -2101,127 +2157,6 @@ def atan2 (y:Float) (x:Float) : Float =
 
 def atan (x:Float) : Float = atan2 x 1.0
 
-'## Complex numbers
-
-data Complex = MkComplex Float Float  -- real, imaginary
-
-instance HasAllClose Complex
-  allclose = \atol rtol (MkComplex a b) (MkComplex c d). (a ~~ c) && (b ~~ d)
-
-instance HasDefaultTolerance Complex
-  atol = MkComplex atol atol
-  rtol = MkComplex rtol rtol
-
-instance Eq Complex
-  (==) = \(MkComplex a b) (MkComplex c d). (a == c) && (b == d)
-
-instance Add Complex
-  add = \(MkComplex a b) (MkComplex c d). MkComplex (a + c) (b + d)
-  zero = MkComplex 0.0 0.0
-instance Sub Complex
-  sub = \(MkComplex a b) (MkComplex c d). MkComplex (a - c) (b - d)
-
-instance Mul Complex
-  mul = \(MkComplex a b) (MkComplex c d).
-    MkComplex (a * c - b * d) (a * d + b * c)
-  one = MkComplex 1.0 0.0
-
-instance VSpace Complex
-  scale_vec = \a:Float (MkComplex c d):Complex. MkComplex (a * c) (a * d)
-
-instance Arbitrary Complex
-  arb = \key. (MkComplex (randn key) (randn key))
-
--- Todo: Hook up to (/) operator.  Might require two-parameter VSpace.
-def complex_division (MkComplex a b:Complex) (MkComplex c d:Complex): Complex =
-  MkComplex ((a * c + b * d) / (c * c + d * d)) ((b * c - a * d) / (c * c + d * d))
-
-def complex_exp (MkComplex a b:Complex) : Complex =
-  expx = exp a
-  MkComplex (expx * cos b) (expx * sin b)
-
-def complex_exp2 (MkComplex a b:Complex) : Complex =
-  exp2x = exp2 a
-  b' = b * log 2.0
-  MkComplex (exp2x * cos b') (exp2x * sin b')
-
-def complex_conj (MkComplex a b:Complex) : Complex = MkComplex a (-b)
-def complex_abs  (MkComplex a b:Complex) : Float = a * a + b * b
-def complex_mag  (MkComplex a b:Complex) : Float = sqrt (a * a + b * b)
-def complex_arg  (MkComplex a b:Complex) : Float = atan2 b a
-
-complex_log   = \x:Complex. MkComplex (log (complex_mag x)) (complex_arg x)
-complex_log2  = \x:Complex. (complex_log x) / log 2.0
-complex_log10 = \x:Complex. (complex_log x) / log 10.0
-complex_pow = \base:Complex power:Complex. complex_exp (power * complex_log base)
-
-def complex_sqrt (MkComplex a b:Complex) : Complex =
-  m = complex_mag $ MkComplex a b
-  MkComplex (sqrt ((a + m) / 2.0)) (sign b * sqrt ((m - a) / 2.0))
-
-def complex_sin  (MkComplex a b:Complex) : Complex = MkComplex (sin  a * cosh b) (cos   a * sinh b)
-def complex_sinh (MkComplex a b:Complex) : Complex = MkComplex (sinh a *  cos b) (cosh  a * sin  b)
-def complex_cos  (MkComplex a b:Complex) : Complex = MkComplex (cos  a * cosh b) (-sin  a * sinh b)
-def complex_cosh (MkComplex a b:Complex) : Complex = MkComplex (cosh a *  cos b) (-sinh a * sin  b)
-def complex_tan  (x:Complex) : Complex = complex_division (complex_sin  x) (complex_cos  x)
-def complex_tanh (MkComplex a b:Complex) : Complex =
-  num = MkComplex (sinh a * cos b) (cosh a * sin  b)
-  den = MkComplex (cosh a * cos b) (sinh a * sin  b)
-  complex_division num den
-
-instance Fractional Complex
-  divide = complex_division
-
-def complex_floor (MkComplex re im:Complex) : Complex =
-  -- from "Complex Floor" by Eugene McDonnell
-  -- https://www.jsoftware.com/papers/eem/complexfloor.htm
-  fr = floor re
-  fi = floor im
-  x = re - fr
-  y = im - fi
-  case (x + y) < 1.0 of
-    True -> MkComplex fr fi
-    False -> case x >= y of
-      True  -> MkComplex (fr + 1.0) fi
-      False -> MkComplex fr (fi + 1.0)
-
-complex_ceil =  \x:Complex. -(complex_floor (-x))
-complex_round = \x:Complex. complex_floor $ MkComplex 0.5 0.0
-
-complex_lgamma : Complex -> Complex = \x:Complex.
-  todo  -- This one is pretty hairy.
-        -- See https://cs.uwaterloo.ca/research/tr/1994/23/CS-94-23.pdf
-
-def complex_log1p (x:Complex) : Complex =
-  (MkComplex a b) = x
-  case a == 0.0 of
-    True -> x
-    False ->
-      u = x + MkComplex 1.0 0.0
-      case a <= -1.0 of
-        True -> complex_log u
-        False -> divide ((complex_log u) * x) x
-
-instance Floating Complex
-  exp    = complex_exp
-  exp2   = complex_exp2
-  log    = complex_log
-  log2   = complex_log2
-  log10  = complex_log10
-  log1p  = complex_log1p
-  sin    = complex_sin
-  cos    = complex_cos
-  tan    = complex_tan
-  sinh   = complex_sinh
-  cosh   = complex_cosh
-  tanh   = complex_tanh
-  floor  = complex_floor
-  ceil   = complex_ceil
-  round  = complex_round
-  sqrt   = complex_sqrt
-  pow    = complex_pow
-  lgamma = complex_lgamma
-
 
 '## Miscellaneous utilities
 TODO: all of these should be in some other section
@@ -2232,6 +2167,9 @@ def reflect {n} [Ix n] (i:n) : n =
 def reverse {n a} (x:n=>a) : n=>a =
   for i. x.(reflect i)
 
+def wrap_periodic (n:Type) [Ix n] (i:Nat) : n = 
+  unsafe_from_ordinal n  $ mod i (size n)
+
 def pad_to {n a} (m:Type) [Ix m] (x:a) (xs:n=>a) : m=>a =
   n' = size n
   for i.
@@ -2241,8 +2179,8 @@ def pad_to {n a} (m:Type) [Ix m] (x:a) (xs:n=>a) : m=>a =
       False -> x
 
 def idiv_ceil (x:Nat) (y:Nat) : Nat = idiv x y + b_to_n (rem x y /= 0)
-def intdiv2 (x:Nat) : Nat = %shr x (1 :: Nat)
-def intpow2 (power:Nat) : Nat = %shl (1 :: Nat) power
+def intdiv2 (x:Nat) : Nat = rep_to_nat $ %shr (nat_to_rep x) (1 :: NatRep)
+def intpow2 (power:Nat) : Nat = rep_to_nat $ %shl (1 :: NatRep) (nat_to_rep power)
 def is_odd  (x:Nat) : Bool = rem x 2 == 1
 def is_even (x:Nat) : Bool = rem x 2 == 0
 
@@ -2252,39 +2190,43 @@ def is_power_of_2 (x:Nat) : Bool =
   -- Note: The bitwise and operator (.&.)
   -- is only defined for Byte, which is why
   -- we use %and here. TODO: Make (.&.) polymorphic.
-  if x == 0
+  x' = nat_to_rep x
+  if x' == 0
     then False
-    else 0 == %and x (unsafe_nat_diff x 1)
+    else 0 == %and x' (%isub x' (1::NatRep))
 
+-- This computes the integer part of the binary logarithm of the input.
+-- TODO: natlog2 0 should do something other than underflow the answer.
+-- TODO: Use LLVM ctlz intrinsic instead.  It needs a slightly new
+-- code path in ImpToLLVM, because it's the first LLVM intrinsic
+-- we have with a fixed-point argument.
+-- https://llvm.org/docs/LangRef.html#llvm-ctlz-intrinsic
 def natlog2 (x:Nat) : Nat =
-  tmp = yield_state 0 \ansRef.
-    run_state 1 \cmpRef.
-      while do
-        if x >= (get cmpRef)
-          then
-            ansRef := (get ansRef) + 1
-            cmpRef := %shl (get cmpRef) (1 :: Nat)
-            True
-          else
-            False
+  tmp = yield_state 0 \ans.
+    cmp <- run_state 1
+    while do
+      if x >= (get cmp)
+        then
+          ans := (get ans) + 1
+          cmp := rep_to_nat $ %shl (nat_to_rep $ get cmp) (1 :: NatRep)
+          True
+        else
+          False
   unsafe_nat_diff tmp 1  -- TODO: something less horrible
 
-def general_integer_power {a} (times:a->a->a) (one:a) (base:a) (power:Nat) : a =
+def general_integer_power {a} [Data a] (times:a->a->a) (one:a) (base:a) (power:Nat) : a =
+  iters = if power == 0 then 0 else 1 + natlog2 power
   -- Implements exponentiation by squaring.
   -- This could be nicer if there were a way to explicitly
   -- specify which typelcass instance to use for Mul.
   yield_state one \ans.
-    with_state power \pow. with_state base \z.
-      while do
-        if get pow > 0
-          then
-            if is_odd (get pow)
-              then ans := times (get ans) (get z)
-            z := times (get z) (get z)
-            pow := intdiv2 (get pow)
-            True
-          else
-            False
+    pow <- with_state power
+    z <- with_state base
+    for _:(Fin iters).
+      if is_odd (get pow)
+        then ans := times (get ans) (get z)
+      z := times (get z) (get z)
+      pow := intdiv2 (get pow)
 
 def intpow {a} [Mul a] (base:a) (power:Nat) : a =
   general_integer_power (*) one base power
@@ -2313,22 +2255,22 @@ def list_length {a} ((AsList n _):List a) : Nat = n
 def concat {n a} (lists:n=>(List a)) : List a =
   totalSize = sum for i. list_length lists.i
   AsList _ $ with_state 0 \listIdx.
-    with_state 0 \eltIdx.
-      for i:(Fin totalSize).
-        while do
-          continue = get eltIdx >= list_length (lists.((get listIdx)@_))
-          if continue
-            then
-              eltIdx := 0
-              listIdx := get listIdx + 1
-            else ()
-          continue
-        (AsList _ xs) = lists.((get listIdx)@_)
-        eltIdxVal = get eltIdx
-        eltIdx := eltIdxVal + 1
-        xs.(eltIdxVal@_)
+    eltIdx <- with_state 0
+    for i:(Fin totalSize).
+      while do
+        continue = get eltIdx >= list_length (lists.((get listIdx)@_))
+        if continue
+          then
+            eltIdx := 0
+            listIdx := get listIdx + 1
+          else ()
+        continue
+      (AsList _ xs) = lists.((get listIdx)@_)
+      eltIdxVal = get eltIdx
+      eltIdx := eltIdxVal + 1
+      xs.(eltIdxVal@_)
 
-def cat_maybes {a n} (xs:n=>Maybe a) : List a =
+def cat_maybes {a n} [Data a] (xs:n=>Maybe a) : List a =
   (num_res, res_inds) = yield_state (0::Nat, for i:n. Nothing) \ref.
     for i. case xs.i of
       Just _ ->
@@ -2343,10 +2285,10 @@ def cat_maybes {a n} (xs:n=>Maybe a) : List a =
         Nothing -> todo -- Impossible
       Nothing -> todo -- Impossible
 
-def filter {a n} [Ix n] (condition:a->Bool) (xs:n=>a) : List a =
+def filter {a n} [Ix n, Data a] (condition:a->Bool) (xs:n=>a) : List a =
   cat_maybes $ for i. if condition xs.i then Just xs.i else Nothing
 
-def arg_filter {a n} [Ix n] (condition:a->Bool) (xs:n=>a) : List n =
+def arg_filter {a n} [Ix n, Data a] (condition:a->Bool) (xs:n=>a) : List n =
   cat_maybes $ for i. if condition xs.i then Just i else Nothing
 
 -- TODO: use `ix_offset : [Ix n] -> n -> Int -> Maybe n` instead
@@ -2422,10 +2364,8 @@ def dex_test_mode (():Unit) : Bool = unsafe_io do check_env "DEX_TEST_MODE"
 TODO: move `error` and `todo` to here.
 
 def catch {a eff} (f:Unit -> {Except|eff} a) : {|eff} Maybe a =
-  ans = %catchException f
-  case %sumToVariant ans of
-    {|c=()   |} -> Nothing
-    {|c|c=val|} -> Just val
+  f' : (Unit -> {Except|eff} a) = \_. f ()
+  %catchException f'
 
 def throw {a} (_:Unit) : {Except} a =
   %throwException a
@@ -2433,6 +2373,25 @@ def throw {a} (_:Unit) : {Except} a =
 def assert (b:Bool) : {Except} Unit =
   if not b then throw ()
 
+'### Misc instances that require `error`
+
+instance Subset a (a|b) given {a b} [Data a, Data b]
+  inject' = \x. Left x
+  project' = \x. case x of
+    Left  y -> Just y
+    Right x -> Nothing
+  unsafe_project' = \x. case x of
+    Left  x -> x
+    Right x -> error "Can't project Right branch to Left branch"
+
+instance Subset a (b|a) given {a b} [Data a, Data b]
+  inject' = \x. Right x
+  project' = \x. case x of
+    Left  x -> Nothing
+    Right y -> Just y
+  unsafe_project' = \x. case x of
+    Left  x -> error "Can't project Left branch to Right branch"
+    Right x -> x
 
 '## Testing Helpers
 
@@ -2459,9 +2418,99 @@ def reversed_digits_to_int {a b} [Ix a, Ix b] (digits: a=>b) : Nat =
     next_base = cur_base * base
     (next_k, next_base)
 
-instance {a b} [Ix a, Ix b] Ix (a=>b)
+instance Ix (a=>b) given {a b} [Ix a, Ix b]
   -- 0@a is the least significant digit,
   -- while (size a - 1)@a is the most significant digit.
   size = intpow (size b) (size a)
   ordinal             = reversed_digits_to_int
   unsafe_from_ordinal = int_to_reversed_digits
+
+instance NonEmpty (a=>b) given {a b} [Ix a, NonEmpty b]
+  first_ix = unsafe_from_ordinal _ 0
+
+'### stack
+-- TODO: replace `DynBuffer` with this?
+
+def Stack (h:Heap) (a:Type) [Data a] = Ref h (Nat & List a)
+
+def stack_size {h a} (stack:Stack h a) : {State h} Nat = get $ fst_ref stack
+
+def unsafe_get_stack_buffer {h a} (stack:Stack h a) : {State h} (Ref h (Fin 0 => a)) =
+  get $ snd_ref $ unsafe_coerce (Ref h (Nat & (Ref h (Fin 0 => a)))) (snd_ref stack)
+
+def stack_buf_size {h a} (stack:Stack h a) : {State h} Nat =
+  get $ fst_ref $ unsafe_coerce (Ref h (Nat & (Ref h (Fin 0 => a)))) (snd_ref stack)
+
+def ensure_size_at_least {h a} (stack:Stack h a) (req_size:Nat) : {State h} Unit =
+  if req_size > stack_buf_size stack then
+    -- TODO: maybe this should use integer arithmetic?
+    new_buf_size = f_to_n $ pow 2.0 (ceil $ log2 $ n_to_f req_size)
+    buf = unsafe_get_stack_buffer stack
+    logical_size = stack_size stack
+    cur_data = get $ unsafe_coerce (Ref h (Fin logical_size => a)) buf
+    snd_ref stack := to_list for i:(Fin new_buf_size).
+      case to_ix (Fin logical_size) (ordinal i) of
+        Just i' -> cur_data.i'
+        Nothing -> uninitialized_value
+
+def read_stack {h a} (stack:Stack h a) : {State h} (List a) =
+  n = stack_size stack
+  buf = unsafe_coerce (Ref h (Fin n => a)) (unsafe_get_stack_buffer stack)
+  AsList n (get buf)
+
+@noinline
+def stack_push {a} [Data a] {h} (stack:Stack h a) (x:a) : {State h} Unit =
+  n_old = stack_size stack
+  n_new = n_old + 1
+  ensure_size_at_least stack n_new
+  buf = unsafe_get_stack_buffer stack
+  buf ! (unsafe_from_ordinal _ n_old) := x
+  fst_ref stack := n_new
+
+-- TODO: we need to put the arguments in this order because the compiler
+-- currently requires the non-data args to come before the data args. We should
+-- fix that.
+-- In particular, we cannot rely on the Data and Ix constraints to be auto-inferred,
+-- because of Issue 1229 https://github.com/google-research/dex-lang/issues/1229.
+@noinline
+def stack_extend {a n} [Data a, Ix n] {h} (stack:Stack h a) (x:n=>a) : {State h} Unit =
+  n_old = stack_size stack
+  n_new = n_old + size n
+  ensure_size_at_least stack n_new
+  buf = unsafe_get_stack_buffer stack
+  buf_slice = unsafe_coerce (Ref h (n=>a)) (buf ! (unsafe_from_ordinal _ n_old))
+  buf_slice := x
+  fst_ref stack := n_new
+
+def stack_pop {a h} [Data a] (stack:Stack h a) : {State h} Maybe a =
+  n_old = stack_size stack
+  case n_old == 0 of
+    True -> Nothing
+    False ->
+      n_new = unsafe_nat_diff n_old 1
+      buf = unsafe_get_stack_buffer stack
+      fst_ref stack := n_new
+      Just $ get buf!(unsafe_from_ordinal _ n_new)
+
+stack_init_size = 16
+def with_stack {r eff} (a:Type) [Data a] (f : (h:Heap) ?-> Stack h a -> {State h|eff} r) : {|eff} r =
+  init_stack = to_list for i:(Fin stack_init_size). uninitialized_value
+  with_state (0, init_stack) \ref . f ref
+
+def stack_extend_internal {n h} (stack:Stack h Char) (x:Fin n=>Char) : {State h} Unit =
+  stack_extend stack x
+
+def stack_push_internal {h} (stack:Stack h Char) (x:Char) : {State h} Unit =
+  stack_push stack x
+
+def with_stack_internal (f : (h:Heap) ?-> Stack h Char -> {State h} Unit) : List Char =
+  with_stack Char \stack.
+    f stack
+    read_stack stack
+
+def show_any {a} (x:a) : String = unsafe_coerce String $ %showAny x
+
+def coerce_table {n a} [Data a] (m:Type) [Ix m] (x:n=>a) : m => a =
+  if size m == size n
+    then unsafe_coerce (m=>a) x
+    else error "mismatched sizes in table coercion"

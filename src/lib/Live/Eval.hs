@@ -9,20 +9,22 @@ module Live.Eval (RFragment (..), SetVal(..), watchAndEvalFile) where
 import Control.Concurrent (forkIO, killThread, readChan, threadDelay, ThreadId)
 import Control.Monad.Reader
 import Control.Monad.State.Strict
+import Data.ByteString qualified as BS
 import Data.Text (Text)
-import Data.Text.IO qualified as T
-import qualified Data.Map.Strict as M
+import Data.Text.Encoding qualified as T
+import Data.Map.Strict qualified as M
 
 import Data.Aeson (ToJSON, toJSON, (.=))
-import qualified Data.Aeson as A
+import Data.Aeson qualified as A
 import Data.Text.Prettyprint.Doc
 import System.Directory (getModificationTime)
 
+import ConcreteSyntax
 import Actor
-import Parser
 import RenderHtml (ToMarkup, pprintHtml)
-import Syntax
 import TopLevel
+import Types.Misc
+import Types.Source
 import Util (onFst, onSnd)
 
 type NodeId = Int
@@ -154,16 +156,16 @@ data DriverEvent = FileChanged SourceContents
                  | WorkComplete (WithId TopStateEx) (WithId SourceBlock) (Result, TopStateEx)
 
 runDriver :: DriverCfg -> TopStateEx -> Actor DriverEvent
-runDriver cfg env self =
+runDriver cfg env self = do
   liftM fst
-  $ flip runStateT (initialEvalState env, emptyCache)
-  $ flip runReaderT (sendOnly self)
-  $ flip runReaderT cfg
-  $ drive $ forever $ do
-      msg <- liftIO $ readChan self
-      case msg of
-        (FileChanged source) -> evalSource env source
-        (WorkComplete block topState payload) -> processWork block topState payload
+    $ flip runStateT (initialEvalState env, emptyCache)
+    $ flip runReaderT (sendOnly self)
+    $ flip runReaderT cfg
+    $ drive $ forever $ do
+        msg <- liftIO $ readChan self
+        case msg of
+          (FileChanged source) -> evalSource env source
+          (WorkComplete block topState payload) -> processWork block topState payload
 
 -- Start evaluation of the (updated) source file in the given (fresh)
 -- evaluation state.  The evaluation state carried in the monad is
@@ -317,7 +319,7 @@ forkWatchFile fname chan = onmod fname $ sendFileContents fname chan
 sendFileContents :: String -> PChan Text -> IO ()
 sendFileContents fname chan = do
   putStrLn $ fname ++ " updated"
-  s <- T.readFile fname
+  s <- T.decodeUtf8 <$> BS.readFile fname
   sendPChan chan s
 
 onmod :: FilePath -> IO () -> IO ()
@@ -338,7 +340,6 @@ instance Driver DriverM where
   askOptions = DriverM $ asks fst
   askResultsOutput = DriverM $ asks snd
   askSelf = DriverM $ lift $ ask
-
   getTopState = DriverM $ do
     (SourceEvalState s _ _) <- gets fst
     return s

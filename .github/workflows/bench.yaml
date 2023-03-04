@@ -21,9 +21,15 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.9
+
     - name: Install system dependencies
       run: |
         ${{ matrix.install_deps }}
+        pip install numpy "jax[cpu]"
         echo "${{ matrix.path_extension }}" >> $GITHUB_PATH
 
     - name: Cache

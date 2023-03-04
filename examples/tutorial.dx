@@ -30,9 +30,7 @@ x = for i:Height. for j:Width. 1.0
 ' Once we have a variable, we can print it.
 
 x
-> [ [1., 1., 1., 1., 1., 1., 1., 1.]
-> , [1., 1., 1., 1., 1., 1., 1., 1.]
-> , [1., 1., 1., 1., 1., 1., 1., 1.] ]
+> [[1., 1., 1., 1., 1., 1., 1., 1.], [1., 1., 1., 1., 1., 1., 1., 1.], [1., 1., 1., 1., 1., 1., 1., 1.]]
 
 ' More interestingly, we can also see its type with `:t`. This type tells us
   that `x` is a two-dimensional table, whose first dimension has type `Height` and
@@ -131,7 +129,7 @@ r = x.(2 :: Int)
 >   Actual: Int32
 >
 > r = x.(2 :: Int)
->          ^^^
+>       ^^^^^^^^^^
 
 ' Instead, it is necessary to cast the integer into the index type of the
   current shape. This type annotation is done with the `@` operator.
@@ -194,7 +192,7 @@ gradient = for i:Height. for j:Width. n_to_f ((ordinal i) + (ordinal j))
 ' Tuple indices also provide an ordinal value.
 
 for pair:(Fin 2 & Fin 3). ordinal pair
-> [0, 1, 2, 3, 4, 5]@(Fin 2 & Fin 3)
+> [0, 1, 2, 3, 4, 5]
 
 
 ' Many algorithms in Dex come down to being able to pack and unpack these
@@ -286,7 +284,7 @@ def tableAdd' {m n} (x : m => n => Float32) (y : m => n => Float32) : m => n => 
 >   Actual: ((Fin 8) => (Fin 3) => Float32)
 >
 > :t tableAdd' x (trans x)
->                 ^^^^^^^
+>                ^^^^^^^^^
 
 ' The type system checked for us that the input tables indeed have the same shape.
 
@@ -516,7 +514,7 @@ tableMean (for (i, j). (x.i.j, x.i.j))
 >   Actual: (Float32 & Float32)
 >
 > tableMean (for (i, j). (x.i.j, x.i.j))
->                         ^^^^^^^^^^^^
+>                        ^^^^^^^^^^^^^^
 
 ' Intuitively, supporting this seems possible. We just need to be able to
   add and divide pair types. Let's look closer at the exact types of the
@@ -587,14 +585,14 @@ tableMean' [(1.0, 0.5), (0.5, 0.8)]
 ' tuple types.
 
 ' ```
-instance {v w} [Add v, Add w] Add (v & w)
+instance Add (v & w) given {v w} [Add v, Add w]
   add = \(x1,x2) (y1, y2). (x1 + y1, x2 + y2)
   zero = (zero, zero)
  
-instance {v w} [Sub v, Sub w] Sub (v & w)
+instance Sub (v & w) given {v w} [Sub v, Sub w]
   sub = \(x1,x2) (y1, y2). (x1 - y1, x2 - y2)
  
-instance {v w} [VSpace v, VSpace w] VSpace (v & w)
+instance VSpace (v & w) given {v w} [VSpace v, VSpace w]
   scale_vec = \s (x, y). (scale_vec s x, scale_vec s y)
 
 '## More Fashion MNist
@@ -681,7 +679,7 @@ temptab
 
 shoes = (5 @ Class)
 
-def findShoes {a b} (x : a=>b) (y : a=>Class) : List b =
+def findShoes {a b} [Data b] (x : a=>b) (y : a=>Class) : List b =
   concat for i. case (y.i == (5 @ _)) of
     True  -> to_list [x.i]
     False -> to_list []

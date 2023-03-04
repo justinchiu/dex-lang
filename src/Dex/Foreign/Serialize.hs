@@ -17,10 +17,11 @@ import Foreign.C
 import Foreign.Ptr
 import Foreign.Storable
 
+import IRVariants
 import Name
-import Syntax
-import Serialize (pprintVal)
 import TopLevel
+import Types.Core hiding (CAtom)
+import Types.Primitives
 
 import Dex.Foreign.Context
 import Dex.Foreign.Util
@@ -28,11 +29,10 @@ import Dex.Foreign.Util
 -- TODO: Free!
 dexPrint :: Ptr Context -> Ptr AtomEx -> IO CString
 dexPrint contextPtr atomPtr = do
-  Context evalConfig env <- fromStablePtr contextPtr
   AtomEx atom <- fromStablePtr atomPtr
-  fst <$> runTopperM evalConfig env do
+  runTopperMFromContext contextPtr do
     -- TODO: Check consistency of atom and context
-    liftIO . newCString =<< pprintVal (unsafeCoerceE atom)
+    liftIO . newCString =<< printCodegen (unsafeCoerceE atom)
 
 data CAtom = CLit LitVal | CRectArray (Ptr ()) [Int] [Int]
 
@@ -69,7 +69,7 @@ instance Storable CAtom where
         Float32Lit v -> val @Word64 1 4 >> val 2 v
         Word32Lit  v -> val @Word64 1 5 >> val 2 v
         Word64Lit  v -> val @Word64 1 6 >> val 2 v
-        PtrLit     _ -> error "Unsupported"
+        PtrLit   _ _ -> error "Unsupported"
     CRectArray _ _ _ -> error "Unsupported"
     where
       val :: forall a. Storable a => Int -> a -> IO ()
@@ -78,12 +78,16 @@ instance Storable CAtom where
 dexToCAtom :: Ptr AtomEx -> Ptr CAtom -> IO CInt
 dexToCAtom atomPtr resultPtr = do
   AtomEx atom <- fromStablePtr atomPtr
-  case atom of
-    Con con -> case con of
-      Lit l          -> poke resultPtr (CLit l) $> 1
-      _ -> notSerializable
-    _ -> notSerializable
+  scalarAtomToCAtom atom
   where
+    scalarAtomToCAtom :: Atom CoreIR n -> IO CInt
+    scalarAtomToCAtom atom = case atom of
+      Con con -> case con of
+        Lit l -> poke resultPtr (CLit l) $> 1
+        _ -> notSerializable
+      NewtypeCon NatCon rep -> scalarAtomToCAtom rep
+      _ -> notSerializable
+
     notSerializable = setError "Unserializable atom" $> 0
 
 dexFromCAtom :: Ptr CAtom -> IO (Ptr AtomEx)

@@ -45,29 +45,8 @@ def dex_call_abstract_eval_with_shape(*args, func_atom):
   native_func = get_compiled(func_atom)
   arg_sig = native_func.explicit_argument_signature
   res_sig = native_func.result_signature
-  if len(args) != len(arg_sig):
-    raise RuntimeError(f"Dex function expects {len(arg_sig)} arguments, but was given {len(args)}")
-  if not all(isinstance(arg, jax.core.ShapedArray) for arg in args):
-    raise RuntimeError("Cannot perform evaluation of Dex functions without known shapes")
-  # Check arguments and infer shape parameters
-  shape_vars = {}
-  for i, (arg, b) in enumerate(zip(args, arg_sig)):
-    expected_dtype = np.dtype(b.type.ctype)
-    if arg.dtype != expected_dtype:
-      raise RuntimeError(f"dtype mismatch in arg {i}: expected {expected_dtype}, got {arg.dtype}")
-    if isinstance(b.type, ScalarType):
-      expected_shape = ()
-    elif isinstance(b.type, RectContArrayType):
-      expected_shape = b.type.shape
-    else:
-      raise AssertionError("Unhandled case!")
-    if len(arg.shape) != len(expected_shape):
-      raise RuntimeError(f"rank mismatch in arg {i}: expected {len(expected_shape)}, got {len(arg.shape)}")
-    inferred_shape = tuple(
-      size if isinstance(size, int) else shape_vars.setdefault(size, real_size)
-      for size, real_size in zip(expected_shape, arg.shape))
-    if arg.shape != inferred_shape:
-      raise RuntimeError(f"shape mismatch in arg {i}: expected {inferred_shape}, got {arg.shape}")
+  # Unify argument types with argument signature
+  shape_vars = unify_jax_and_dex_types(args, arg_sig)
   # Infer result types
   result_avals = []
   for b in res_sig:
@@ -79,6 +58,32 @@ def dex_call_abstract_eval_with_shape(*args, func_atom):
     result_avals.append(jax.core.ShapedArray(shape, dtype))
   assert len(result_avals) == 1  # TODO: Make dex_call a multiple_results primitive
   return result_avals[0], shape_vars
+
+def unify_jax_and_dex_types(jax_types, dex_binders):
+  if len(jax_types) != len(dex_binders):
+    raise RuntimeError(f"Dex function expects {len(dex_binders)} arguments, but was given {len(jax_types)}")
+  if not all(isinstance(arg, jax.core.ShapedArray) for arg in jax_types):
+    raise RuntimeError("Cannot perform evaluation of Dex functions without known shapes")
+  # Check arguments and infer shape parameters
+  shape_vars = {}
+  for i, (jax_ty, b) in enumerate(zip(jax_types, dex_binders)):
+    expected_dtype = np.dtype(b.type.ctype)
+    if jax_ty.dtype != expected_dtype:
+      raise RuntimeError(f"dtype mismatch in arg {i}: expected {expected_dtype}, got {jax_ty.dtype}")
+    if isinstance(b.type, ScalarType):
+      expected_shape = ()
+    elif isinstance(b.type, RectContArrayType):
+      expected_shape = b.type.shape
+    else:
+      raise AssertionError("Unhandled case of Dex type!")
+    if len(jax_ty.shape) != len(expected_shape):
+      raise RuntimeError(f"rank mismatch in arg {i}: expected {len(expected_shape)}, got {len(jax_ty.shape)}")
+    inferred_shape = tuple(
+      size if isinstance(size, int) else shape_vars.setdefault(size, real_size)
+      for size, real_size in zip(expected_shape, jax_ty.shape))
+    if jax_ty.shape != inferred_shape:
+      raise RuntimeError(f"shape mismatch in arg {i}: expected {inferred_shape}, got {jax_ty.shape}")
+  return shape_vars
 
 @dex_apply_p.def_abstract_eval
 def dex_call_abstract_eval(*args, **kwargs):
@@ -110,10 +115,23 @@ def dex_apply_lowering(ctx, *args, func_atom):
   custom_call_name = get_trampoline()
   ctx.module_context.add_keepalive(native)
 
-  # TODO: Support inference of implicit arguments. Abstract eval already does inference!
-  if len(native.argument_signature) != len(native.explicit_argument_signature):
-    raise NotImplementedError("Inference of implicit arguments")
   assert len(args) == len(native.explicit_argument_signature)
+
+  # TODO Cache this from dex_call_abstract_eval_with_shape instead of
+  # recomputing here
+  shape_vars = unify_jax_and_dex_types(
+      ctx.avals_in, native.explicit_argument_signature)
+
+  name_to_mlir_arg = {}
+  for arg, binder in zip(args, native.explicit_argument_signature):
+    name_to_mlir_arg[binder.name] = arg
+  for name, val in shape_vars.items():
+    name_to_mlir_arg[name] = mlir.ir_constant(
+            IdxRepTy(val).value,
+            canonicalize_types=False)
+
+  mlir_args = [name_to_mlir_arg[binder.name]
+               for binder in native.argument_signature]
 
   native_ptr = mlir.ir_constant(
       ctypes.cast(native._as_parameter_, ctypes.c_void_p).value,
@@ -122,9 +140,9 @@ def dex_apply_lowering(ctx, *args, func_atom):
   multi_result = len(ctx.avals_out) > 1
   if multi_result:
     result_type = [mlir.ir.TupleType.get_tuple(result_type)]
-  custom_call = mlir.mhlo.CustomCallOp(
+  custom_call = mlir.hlo.CustomCallOp(
       result_type,
-      (native_ptr, *args),
+      (native_ptr, *mlir_args),
       call_target_name=mlir.ir.StringAttr.get(custom_call_name),
       has_side_effect=mlir.ir.BoolAttr.get(False),
       api_version=mlir.i32_attr(2),
@@ -133,7 +151,7 @@ def dex_apply_lowering(ctx, *args, func_atom):
       operand_layouts=None,
       result_layouts=None)
   if multi_result:
-    return [mlir.mhlo.GetTupleElementOp(custom_call.result, mlir.i32_attr(i)).result
+    return [mlir.hlo.GetTupleElementOp(custom_call.result, mlir.i32_attr(i)).result
             for i in range(len(ctx.avals_out))]
   else:
     return custom_call.result,
@@ -174,16 +192,33 @@ def dex_call_batched(batched_args, batched_dims, func_atom):
   func_name = func_atom.name
   assert func_name is not None
 
+  # TODO: Make it possible to get the signature without compiling the function
+  native = get_compiled(func_atom)
+  expl_args = native.explicit_argument_signature
+  if len(batched_args) != len(expl_args):
+    raise RuntimeError(f"Dex function expects {len(expl_args)} arguments, but was given {len(batched_args)}")
+
+  batched_args = []
+  batched_dims_it = iter(batched_dims)
+  for binder in native.argument_signature:
+    if binder.implicit:
+      batched_args.append("{" + binder.name + "}")
+    else:
+      ty = binder.type.dex_annotation()
+      if next(batched_dims_it) is not batching.not_mapped:
+        ty = f"(Fin {batch_size}) => {ty}"
+      batched_args.append(f"({binder.name} : {ty})")
+
   # Only index into the arguments which are batched. `i` is the index used for
   # the Dex for loop constructor.
   batched_fn_params = [
-      f"x{param_idx}" if dim is batching.not_mapped else f"x{param_idx}.i"
-      for param_idx, dim in enumerate(batched_dims)
+      binder.name if dim is batching.not_mapped else f"{binder.name}.i"
+      for dim, binder in zip(batched_dims, expl_args)
   ]
 
   # This is the actual batching expression
   batched_fn = module.eval(
-      r"\ " + " ".join(f"x{i}" for i in range(len(batched_args))) + ". "
+      r"\ " + " ".join(batched_args) + ". "
       + f"for i:(Fin {batch_size}). {func_name} "
       + " ".join(batched_fn_params))
 
@@ -210,33 +245,50 @@ def dex_call_jvp(arg_values, arg_tangents, func_atom):
   Returns:
      A pair of the primal output and the tangent.
   """
-  assert len(func_atom.compile().result_signature) == 1
+  # TODO: Make it possible to get the signature without compiling the function
+  native = get_compiled(func_atom)
+  assert len(native.result_signature) == 1
   num_args = len(arg_values)
   module = func_atom.module.copy()
 
-  # Helper functions to build strings of primal and tangent inputs.
-  def arg_string(prefix):
-    return " ".join(f"{prefix}{i}" for i in range(num_args))
-
-  def tuple_string(prefix):
-    return "(" + ", ".join(f"{prefix}{i}" for i in range(num_args)) + ")"
+  # TODO: Support explicit arguments that are not being differentiated wrt
+  # TODO: What if some explicit primal argument occurs in the type annotation of later one?
+  # - If this happens, I have to either retain the name of the primal, or rename the annotation.
+  # - Retaining the name of the primal is a problem, though, because then a constructed tangent name
+  #   might clash with it.  (Solvable by maintaining an explicit name mapping.)
+  implicit_args = []
+  primals = []
+  tangents = []
+  name_to_ty = {}
+  for binder in native.argument_signature:
+    if binder.implicit:
+      implicit_args.append("{" + binder.name + "}")
+    else:
+      annot = binder.type.dex_annotation()
+      p_name = f"p{binder.name}"
+      primals.append(p_name)
+      name_to_ty[p_name] = annot
+      t_name = f"t{binder.name}"
+      tangents.append(t_name)
+      name_to_ty[t_name] = annot
 
   # Add the current function atom as a variable in the context, so that we can
-  # use it to apply batching.
+  # use it to apply jvp.
 
-  jax_func_name = func_atom.name
-  assert jax_func_name is not None
+  func_name = func_atom.name
+  assert func_name is not None
 
-  # `linearize` only seems to work properly for functions which take a single
-  # input argument, so we uncurry `func_atom` to make it into this form. The
-  # evaluated string for three function arguments should look like:
+  # `linearize` only seems to work properly for functions which take a
+  # single input argument, so we uncurry `func_atom` to make it into
+  # this form. The evaluated string for three function arguments (and
+  # three implicit arguments) should look like:
   # ```
-  # \ (x0, x1, x2). jax_func x0 x1 x2
+  # \ {n1} {n2} {n3} ((p1, p2, p3):(ty1 & ty2 & ty3)). func p1 p2 p3
   # ```
   uncurried = module.eval(
-      f"\\ {tuple_string('x')}. {jax_func_name} {arg_string('x')}")
-  jax_func_uncurried_name = uncurried.name
-  assert jax_func_uncurried_name is not None
+      f"\\ {juxt_string(implicit_args)} {tuple_arg_string(primals, name_to_ty)}. {func_name} {juxt_string(primals)}")
+  func_uncurried_name = uncurried.name
+  assert func_uncurried_name is not None
 
   # We create separate primitives for the primal and tangent evaluations, since
   # we only want to apply tranposition to the tangent evaluation function.
@@ -244,14 +296,14 @@ def dex_call_jvp(arg_values, arg_tangents, func_atom):
   # Here we write out the tangent evaluation expression in pointful style.
   # The evaluated string for three function arguments should look like:
   # ```
-  # \ x0 x1 x2 u0 u1 u2.
-  #   linearized = linearize jax_func_uncurried (x0, x1, x2)
-  #   snd linearized (u0 u1 u2)
+  # \ {n1} {n2} {n3} (p1:ty1) (p2:ty2) (p3:ty3) (t1:ty1) (t2:ty2) (t3:ty3).
+  #   linearized = linearize func_uncurried (p1, p2, p3)
+  #   snd linearized (t1, t2, t3)
   # ```
   evaluate_linearized = module.eval(
-      f"\\ {arg_string('x')} {arg_string('u')}." +
-      f"\n  linearized = linearize {jax_func_uncurried_name} {tuple_string('x')}" +
-      f"\n  snd linearized {tuple_string('u')}")
+      f"\\ {juxt_string(implicit_args)} {juxt_arg_string(primals, name_to_ty)} {juxt_arg_string(tangents, name_to_ty)}." +
+      f"\n  linearized = linearize {func_uncurried_name} {tuple_ref_string(primals)}" +
+      f"\n  snd linearized {tuple_ref_string(tangents)}")
 
   # Materialize jax.ad.Zero values into actual arrays of zeros.
   # TODO: Make the handling of Zeros more efficient by omitting them from the
@@ -270,11 +322,38 @@ def dex_call_jvp(arg_values, arg_tangents, func_atom):
 
 jax.interpreters.ad.primitive_jvps[dex_apply_p] = dex_call_jvp
 
+def juxt_string(names):
+  return " ".join(names)
+
+def juxt_arg_string(names, name_to_ty):
+  annotated = [f"({name} : {name_to_ty[name]})" for name in names]
+  return juxt_string(annotated)
+
+def tuple_arg_string(names, name_to_ty):
+  ty = tuple_ty_ref_string([name_to_ty[name] for name in names])
+  return f"({tuple_ref_string(names)} : {ty})"
+
+def tuple_ref_string(names):
+  if len(names) == 1:
+    return names[0]
+  else:
+    return "(" + ", ".join(names) + ")"
+
+def tuple_ty_ref_string(names):
+  if len(names) == 1:
+    return names[0]
+  else:
+    return "(" + " & ".join(names) + ")"
+
 # === transpose ===
 
 # alias to avoid confusion around overloading of "primal".
 _is_linear_input = jax.ad.is_undefined_primal
 
+
+def hoistable(ty, bound_names):
+  """Is this type hoistable past these names?"""
+  return not ty.free_vars().intersection(set(bound_names))
 
 def dex_call_evaluate_linearized_transpose(cotangents, *args, func_atom):
   """Evaluates the transpose of a function atom.  """
@@ -283,25 +362,45 @@ def dex_call_evaluate_linearized_transpose(cotangents, *args, func_atom):
   # `dex_call_jvp`, applied to a some function atom, called `f`, say.
   # Concretely, if `f` has three primal arguments, `func_atom` should look like:
   # ```
-  # \ x0 x1 x2 u0 u1 u2.
+  # \ {n0} {n1} {n2} x0 x1 x2 t0 t1 t2.
   #   intermediate_linearized = linearize f (x0, x1, x2)
-  #   snd intermediate_linearized (u0 u1 u2)
+  #   snd intermediate_linearized (t0, t1, t2)
   # ```
-  # In particular, its arguments are assumed to be `num_primals` primal inputs,
-  # followed by `num_primals` tangent inputs.
+  # In particular, its explicit arguments are assumed to be
+  # `num_primals` primal inputs, followed by `num_primals` tangent
+  # inputs.
 
   assert len(args) % 2 == 0
   num_primals = len(args) // 2
+  # TODO: Make it possible to get the signature without compiling the function
+  native = get_compiled(func_atom)
+  assert len(args) == len(native.explicit_argument_signature)
   module = func_atom.module.copy()
 
+  # This argument handling sorts all implicit arguments ahead of the
+  # explicit ones when constructing the lambda expression to be
+  # transposed.  This should be fine because (i) the Dex compiler will
+  # automatically reverse the permutation when inferring the implicit
+  # arguments of `func_atom`, and (ii) the implicit argument binders'
+  # types have no dependencies on the explicit arguments (or any
+  # arguments) because they are all array sizes and therefore of Nat
+  # type (which is the only thing the Python interop knows how to
+  # infer anyway).  As a defensive measure, we perform explicit
+  # hoisting checks when doing the reordering.
+  implicit_args = []
+  name_to_ty = {}
+  for binder in native.argument_signature:
+    if binder.implicit:
+      if hoistable(binder.type, name_to_ty.keys()):
+        implicit_args.append("{" + binder.name + "}")
+      else:
+        raise NotImplementedError(f"Hoist check failed: implicit {binder.name} of type {binder.type} depends on a previous explicit binder")
+    else:
+      name_to_ty[binder.name] = binder.type.dex_annotation()
+
   primals, tangents = args[:num_primals], args[num_primals:]
-
-  # Helper functions to build strings of primal and tangent inputs.
-  def arg_string(prefix, index_set):
-    return " ".join(f"{prefix}{i}" for i in index_set)
-
-  def tuple_string(prefix, index_set):
-    return "(" + ", ".join(f"{prefix}{i}" for i in index_set) + ")"
+  primal_params = [binder.name for binder in native.explicit_argument_signature[:num_primals]]
+  tangent_params = [binder.name for binder in native.explicit_argument_signature[num_primals:]]
 
   # JAX uses `UndefinedPrimal` instances to mark input variables which the
   # function needs to be transposed with respect to, and (consequently) for
@@ -342,38 +441,34 @@ def dex_call_evaluate_linearized_transpose(cotangents, *args, func_atom):
   # For a three-input primal function with constant input for the tangent
   # parameter at index 1, the evaluated string should look like:
   # ```
-  # \ x0 x1 x2 u1 ct.
-  #   transpose_linear (\(t0, t2). linearized x0 x1 x2 t0 u1 t2) ct
+  # \ {n0} {n1} {n2} x0 x1 x2 t1 ct.
+  #   transpose_linear (\(t0, t2). linearized x0 x1 x2 t0 t1 t2) ct
   # ```
   # - The `x` variables are the (constant) inputs to the primal function. These
   #   should always be supplied by JAX.
-  # - The `u` variables are the constant tangent inputs, i.e. those which JAX
-  #   does not need us to include in the transpose.
-  # - The `t` variables are the linear inputs which we are transposing with
-  #   respect to. These are tangent inputs to `linearized`.
+  # - The `t` variables are the tangent inputs.  Which one goes where is
+  #   determined by which are constant and which are not.
+  # - Note that we use the original names for the parameters, and include
+  #   their type annotations.  (TODO Include a type annotation for `ct` as well?)
 
-  # x0 x1 x2 u1 ct
+  # {n0} {n1} {n2} x0 x1 x2 t1 ct
   transposed_atom_params = (
-      arg_string("x", range(num_primals)) + " " +
-      arg_string("u", tangent_constant_indices) + " ct")
+      juxt_string(implicit_args) + " " +
+      juxt_arg_string(primal_params, name_to_ty) + " " +
+      juxt_arg_string([tangent_params[i] for i in tangent_constant_indices], name_to_ty) + " ct")
 
   # (t0, t2)
-  linear_lambda_params = tuple_string("t", tangent_input_indices)
+  linear_lambda_params = tuple_arg_string(
+      [tangent_params[i] for i in tangent_input_indices], name_to_ty)
 
-  # t0 u1 t2
-  linearized_tangent_inputs = (" ".join(
-      f"t{i}" if jax.ad.is_undefined_primal(t) else f"u{i}"
-      for i, t in enumerate(tangents)))
+  # x0 x1 x2 t0 t1 t2
+  linearized_inputs = juxt_string(primal_params + tangent_params)
 
-  # x0 x1 x2 t0 u1 t2
-  linearized_inputs = (
-      arg_string("x", range(num_primals)) + " " + linearized_tangent_inputs)
-
-  # \ x0 x1 x2 u1 ct.
-  #   transpose_linear (\(t0, t2). linearized x0 x1 x2 t0 u1 t2) ct
+  # \ {n0} {n1} {n2} x0 x1 x2 t1 ct.
+  #   transpose_linear (\(t0, t2). linearized x0 x1 x2 t0 t1 t2) ct
   transposed = module.eval(
       f"\\ {transposed_atom_params}. transpose_linear " +
-      f"(\ {linear_lambda_params}. {linearized_name} {linearized_inputs}) ct"
+      f"(\\ {linear_lambda_params}. {linearized_name} {linearized_inputs}) ct"
   )
 
   # Tuple of cotangents relating to linear tangent inputs. In the given

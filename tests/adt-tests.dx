@@ -216,7 +216,7 @@ def catLists {a} (xs:List a) (ys:List a) : List a =
 def listToTable {a} ((AsList n xs): List a) : (Fin n)=>a = xs
 
 :t listToTable
-> ((a:Type) ?-> (v#0:(List a)) -> (Fin (ProjectElt [0] v#0)) => a)
+> ((a:Type) ?-> (v#0:(List a)) -> (Fin (ProjectElt 0 (ProjectElt u v#0))) => a)
 
 :p
   l = AsList _ [1, 2, 3]
@@ -228,7 +228,7 @@ def listToTable2 {a} (l: List a) : (Fin (list_length l))=>a =
   xs
 
 :t listToTable2
-> ((a:Type) ?-> (l:(List a)) -> (Fin (ProjectElt [0] l)) => a)
+> ((a:Type) ?-> (l:(List a)) -> (Fin (ProjectElt 0 (ProjectElt u l))) => a)
 
 :p
   l = AsList _ [1, 2, 3]
@@ -312,19 +312,4 @@ data MySum2 =
 -- reproducer for a shadowing bug (PR #440)
 :p concat $ for i:(Fin 2). to_list [(Just [0,0,0], Just [0,0,0]),
                                     (Just [0,0,0], Just [0,0,0])]
-> (AsList 4 [ ((Just [0, 0, 0]), (Just [0, 0, 0]))
->           , ((Just [0, 0, 0]), (Just [0, 0, 0]))
->           , ((Just [0, 0, 0]), (Just [0, 0, 0]))
->           , ((Just [0, 0, 0]), (Just [0, 0, 0])) ])
-
--- bug #818.  Yes, get_at is backwards.  That was what it took to
--- tickle the bug at the time.
-def fadd (x: Float) (y: Float) : Float = x + y
-:t (\p. fadd (get_at p #foo) (get_at p #bar))
-> Type error:
-> Expected: (Iso {foo: a & ...b} (a & {&...b}))
->   Actual: (Iso {bar: c & ...d} (c & {&...d}))
-> (Solving for: [a, b, c, d])
->
-> :t (\p. fadd (get_at p #foo) (get_at p #bar))
->                                        ^^^^
+> (AsList 4 [((Just [0, 0, 0]), (Just [0, 0, 0])), ((Just [0, 0, 0]), (Just [0, 0, 0])), ((Just [0, 0, 0]), (Just [0, 0, 0])), ((Just [0, 0, 0]), (Just [0, 0, 0]))])

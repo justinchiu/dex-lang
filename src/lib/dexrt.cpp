@@ -11,6 +11,21 @@
 #include <cstring>
 #include <thread>
 #include <vector>
+#include <cctype>
+
+#include <type_traits>
+#include <cstdint>
+
+#if defined(__linux__)
+static_assert(std::is_same<pthread_key_t, std::uint32_t>::value,
+              "On linux, expected pthread_key_t to be an uint32_t");
+#elif defined(__APPLE__)
+static_assert(std::is_same<pthread_key_t, unsigned long>::value,
+              "On macOS, Expected pthread_key_t to be an unsigned long");
+static_assert(sizeof(unsigned long) == 8, "Expected 64-bit unsigned long");
+#else
+# error Unsupported OS
+#endif
 
 #ifdef DEX_LIVE
 #include <png.h>
@@ -37,18 +52,19 @@ char* malloc_dex(int64_t nbytes) {
   return ptr + alignment;
 }
 
-char* dex_malloc_initialized(int64_t nbytes) {
-  char *ptr = malloc_dex(nbytes);
-  memset(ptr, 0, nbytes);
-  return ptr;
-}
-
 void free_dex(char* ptr) {
   free(ptr - alignment);
 }
 
 int64_t dex_allocation_size (char* ptr) {
   return *(reinterpret_cast<int64_t*>(ptr - alignment));
+}
+
+void* dex_pthread_key_create () {
+  pthread_key_t* key_ptr = (pthread_key_t*) malloc(sizeof(pthread_key_t));
+  // TODO(dougalm): add destructor. It's not urgent because we only call this once per process at the moment.
+  pthread_key_create(key_ptr, NULL);
+  return (void*) key_ptr;
 }
 
 void* fdopen_w(int fd) {
@@ -160,6 +176,46 @@ void encodePNG(char **resultPtr, int8_t* pixels, int32_t width, int32_t height) 
 
 // The string buffer size used for converting integer and floating-point types.
 static constexpr int showStringBufferSize = 32;
+
+int32_t appendTrailingDecimalDot(char* buffer, int32_t size) {
+  bool needsdot = true;
+  for (int32_t i = 0; i<size; i++) {
+    auto c = *(buffer + i);
+    if (c == '.' || isalpha(c)) {
+      needsdot = false;
+    }
+  }
+  if (needsdot) {
+    *(buffer + size) = '.';
+    size = size + 1;
+  }
+  return size;
+}
+
+// TODO: replace `showFloat32` with `showFloat32_internal` and so on
+int32_t showFloat32_internal(char *resultPtr, float x) {
+  // XXX: we use 2 digits fewer than the max as a hack to make quine tests less
+  // sensitive to floating point behavior
+  auto size = snprintf(resultPtr, showStringBufferSize, "%.*g", __FLT_DECIMAL_DIG__ - 2, x);
+  return appendTrailingDecimalDot(resultPtr, size);
+}
+
+int32_t showFloat64_internal(char *resultPtr, double x) {
+  auto size = snprintf(resultPtr, showStringBufferSize, "%.*g", __FLT_DECIMAL_DIG__ - 2, x);
+  return appendTrailingDecimalDot(resultPtr, size);
+}
+
+int32_t showInt32_internal(char *resultPtr, int32_t x) {
+  return snprintf(resultPtr, showStringBufferSize, "%" PRId32, x);}
+int32_t showInt64_internal(char *resultPtr, int64_t x) {
+  return snprintf(resultPtr, showStringBufferSize, "%" PRId64, x);}
+
+int32_t showWord8_internal(char *resultPtr, uint8_t x) {
+  return snprintf(resultPtr, showStringBufferSize, "0x%" PRIx8, x);}
+int32_t showWord32_internal(char *resultPtr, uint32_t x) {
+  return snprintf(resultPtr, showStringBufferSize, "0x%" PRIx32, x);}
+int32_t showWord64_internal(char *resultPtr, uint64_t x) {
+  return snprintf(resultPtr, showStringBufferSize, "0x%" PRIx64, x);}
 
 void showNat32(char **resultPtr, uint32_t x) {
   auto buffer = reinterpret_cast<char *>(malloc_dex(showStringBufferSize));

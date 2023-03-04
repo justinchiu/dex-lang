@@ -19,6 +19,17 @@ ScalarCType = Union[
 ]
 IdxRepTy = ctypes.c_uint32
 
+dex_types = {
+    ctypes.c_int64: 'Int64',
+    ctypes.c_int32: 'Int32',
+    ctypes.c_uint8: 'Word8',
+    ctypes.c_uint32: 'Word32',
+    ctypes.c_uint64: 'Word64',
+    ctypes.c_double: 'Float64',
+    ctypes.c_float: 'Float32',
+}
+
+
 @dataclass(frozen=True)
 class ScalarType:
   ctype: Any
@@ -37,10 +48,31 @@ class ScalarType:
     instance = self.ctype()
     return ctypes.pointer(instance), lambda: self.from_ctype(instance)
 
+  def dex_annotation(self):
+    return dex_types[self.ctype]
+
+  def free_vars(self):
+    return frozenset()
 
 @dataclass(frozen=True)
 class RectContArrayType:
-  ctype: ScalarType
+  """A rectangular contiguous array with potentially dynamic shape.
+
+  Specifically, the `shape` field is a list of the dimensions.  Each
+  dimension may be a Python `int`, which represents a static size.  It
+  may also be a Python `str`, which represents a dynamic size (a shape
+  variable) with that name.  All dimension sizes with the same name in
+  a given function signature are the same.
+
+  For example, `RectContArrayType(..., ["n", "n"])` means a square
+  matrix, and a function that accepts a `RectContArrayType(..., ["n",
+  "n"])` and produces a `RectContArrayType(..., ["n"])` consumes a
+  square matrix and produces a vector of the same size.
+
+  `RectContArrayType` does not support any computation on array sizes,
+  limiting the constraints that it can represent.
+  """
+  ctype: Any
   shape: List[Union[str, int]]
 
   @property
@@ -56,6 +88,17 @@ class RectContArrayType:
     return ctypes.cast(ctypes.c_void_p(ptr), ctypes.POINTER(self.ctype))
 
   def to_ctype(self, array, name_cvalue):
+    """Unify the given array's type with `self` and return a C pointer to it.
+
+    If the given array's shape is not compatible with the type
+    represented by `self`, raises an error.
+
+    Notably, if the type represented by `self` is dynamic, the
+    `name_cvalue` map serves as the type variable environment.
+    Previously determined sizes are filled in from the environment,
+    and previously undetermined sizes are determined from the input
+    array and *written back into* the environment.
+    """
     if not isinstance(array, np.ndarray):
       array = np.asarray(array)
     if array.ndim != len(self.shape):
@@ -78,6 +121,15 @@ class RectContArrayType:
     result = np.empty(shape, dtype=self.ctype)
     return self.unsafe_array_ptr(result), lambda: result
 
+  def dex_annotation(self):
+    """Return a string in Dex syntax representing the same type as self."""
+    prefix = " => ".join([f"(Fin {str(dim)})" for dim in self.shape])
+    return f"{prefix} => {dex_types[self.ctype]}"
+
+  def free_vars(self):
+    return frozenset([dim for dim in self.shape if isinstance(dim, str)])
+
+
 NativeType = Union[ScalarType, RectContArrayType]
 
 
@@ -89,11 +141,11 @@ class Binder:
 
 
 class NativeFunction:
-  def __init__(self, jit, ptr, calling_convention):
+  def __init__(self, ctx, ptr, calling_convention):
     self._as_parameter_ = ptr
-    self._jit = jit
+    self._ctx = ctx
     self.calling_convention = calling_convention
-    sig_ptr = api.getFunctionSignature(jit, ptr)
+    sig_ptr = api.getFunctionSignature(ctx, ptr)
     if not sig_ptr:
       raise RuntimeError("Failed to retrieve the function signature")
     try:
@@ -122,7 +174,7 @@ class NativeFunction:
   def __del__(self):
     if api.nofree: return
     if hasattr(self, '_as_parameter_'):
-      api.unload(self._jit, self)
+      api.unload(self._ctx, self)
 
   def __call__(self, *args):
     name_to_cval = {}
@@ -188,7 +240,8 @@ class _SignatureParser:
     return False
 
   digit_codes = set(string.digits.encode('ascii'))
-  name_codes = set(string.ascii_letters.encode('ascii')) | digit_codes | {ord('.'), ord('#')}
+  name_codes = (set(string.ascii_letters.encode('ascii'))
+    | digit_codes | {ord('.'), ord('#'), ord('_'), ord('\'')})
 
   def parse_name(self) -> str:
     end = self.offset

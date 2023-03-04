@@ -22,6 +22,11 @@ or these example programs:
   * [Basis function regression](https://google-research.github.io/dex-lang/examples/regression.html)
   * [Brownian bridge](https://google-research.github.io/dex-lang/examples/brownian_motion.html)
   * [Dynamic programming (Levenshtein distance)](https://google-research.github.io/dex-lang/examples/levenshtein-distance.html)
+  * [Molecular dynamics simulation](https://google-research.github.io/dex-lang/examples/md.html)
+
+Or for a more comprehensive look, there's
+
+  * [The InDex](https://google-research.github.io/dex-lang/index.html) of all documents, libraries, and examples included in this repository.
 
 🚨 **Dex is an experimental research project at an early stage of
 development. Expect monstrous bugs and razor-sharp edges!**

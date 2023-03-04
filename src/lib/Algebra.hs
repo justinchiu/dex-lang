@@ -19,14 +19,20 @@ import Data.List (intersperse)
 import Data.Tuple (swap)
 
 import Builder hiding (sub, add, mul)
-import Syntax
-import Name
+import Core
 import Err
+import IRVariants
 import MTL1
+import Name
+import Subst
 import QueryType
+import Types.Core
+import Types.Imp
+import Types.Primitives
+import Util (Tree (..))
 
-type PolyName = Name AtomNameC
-type PolyBinder = NameBinder AtomNameC
+type PolyName = EitherE (AtomName SimpIR) ImpName
+type PolyBinder = AtomNameBinder SimpIR
 
 type Constant = Rational
 
@@ -42,22 +48,26 @@ newtype Polynomial (n::S) =
 -- This is the main entrypoint. Doing polynomial math sometimes lets
 -- us compute sums in closed form. This tries to compute
 -- `\sum_{i=0}^(lim-1) body`. `i`, `lim`, and `body` should all have type `Nat`.
-sumUsingPolys :: (Builder m, Fallible1 m, Emits n)
-              => Atom n -> Abs Binder Block n -> m n (Atom n)
+sumUsingPolys :: (Builder SimpIR m, Fallible1 m, Emits n)
+              => Atom SimpIR n -> Abs (Binder SimpIR) (Block SimpIR) n -> m n (Atom SimpIR n)
 sumUsingPolys lim (Abs i body) = do
   sumAbs <- refreshAbs (Abs i body) \(i':>_) body' -> do
     blockAsPoly body' >>= \case
       Just poly' -> return $ Abs i' poly'
       Nothing -> throw NotImplementedErr $
-        "Algebraic simplification failed to model index computations: " ++ pprint body'
-  limName <- emitAtomToName lim
-  emitPolynomial $ sum limName sumAbs
+        "Algebraic simplification failed to model index computations:\n"
+        ++ "Trying to sum from 0 to " ++ pprint lim ++ " - 1, \\"
+        ++ pprint i' ++ "." ++ pprint body'
+  limName <- emit (Atom lim)
+  emitPolynomial $ sum (LeftE limName) sumAbs
 
 mul :: Polynomial n-> Polynomial n -> Polynomial n
 mul (Polynomial x) (Polynomial y) =
   poly [ (cx * cy, mulMono mx my)
        | (mx, cx) <- toList x, (my, cy) <- toList y]
-  where mulMono (Monomial mx) (Monomial my) = Monomial $ unionWith (+) mx my
+
+mulMono :: Monomial n -> Monomial n -> Monomial n
+mulMono (Monomial mx) (Monomial my) = Monomial $ unionWith (+) mx my
 
 add :: Polynomial n -> Polynomial n -> Polynomial n
 add x y = Polynomial $ unionWith (+) (fromPolynomial x) (fromPolynomial y)
@@ -78,18 +88,21 @@ sum lim (Abs i p) = sumPolys polys
                  mulConst c $ sumMono lim (Abs i m)
 
 sumMono :: PolyName n -> Abs PolyBinder Monomial n -> Polynomial n
-sumMono lim (Abs b (Monomial m)) = case lookup (binderName b) m of
+sumMono lim (Abs b (Monomial m)) = case lookup (LeftE $ binderName b) m of
   -- TODO: Implement the formula for arbitrary order polynomials
-  Nothing  -> poly [(1, Monomial $ insert lim 1 c)]
+  Nothing  -> poly [ (   1, mulMono c $ mono [(lim, 1)])]
   Just 0   -> error "Each variable appearing in a monomial should have a positive power"
   -- Summing exclusive of `lim`: Sum_{i=1}^{n-1} i = (n-1)n/2 = 1/2 n^2 - 1/2 n
-  Just 1   -> poly [(1/2, Monomial $ insert lim 2 c), (-1/2, Monomial $ insert lim 1 c)]
+  Just 1   -> poly [ ( 1/2, mulMono c $ mono [(lim, 2)])
+                   , (-1/2, mulMono c $ mono [(lim, 1)])]
   -- Summing exclusive of `lim`: Sum_{i=1}^{n-1} i^2 = (n-1)n(2n-1)/6 = 1/3 n^3 - 1/2 n^2 + 1/6 n
-  Just 2   -> poly [(1/3, Monomial $ insert lim 3 c), (-1/2, Monomial $ insert lim 2 c), (1/6, Monomial $ insert lim 1 c)]
+  Just 2   -> poly [ ( 1/3, mulMono c $ mono [(lim, 3)])
+                   , (-1/2, mulMono c $ mono [(lim, 2)])
+                   , ( 1/6, mulMono c $ mono [(lim, 1)])]
   (Just n) -> error $ "Triangular arrays of order " ++ show n ++ " not implemented yet!"
   where
-    c = fromMonomial $ ignoreHoistFailure $ hoist b $  -- failure impossible
-          Monomial $ delete (binderName b) m
+    c = ignoreHoistFailure $ hoist b $  -- failure impossible
+          Monomial $ delete (LeftE $ binderName b) m
 
 -- === Constructors and singletons ===
 
@@ -111,43 +124,54 @@ _showPoly (Polynomial p) =
 
 -- === core expressions as polynomials ===
 
-type PolySubstVal = SubstVal AtomNameC (MaybeE Polynomial)
-type BlockTraverserM i o a = SubstReaderT PolySubstVal (MaybeT1 BuilderM) i o a
+data PolySubstVal (c::C) (n::S) where
+  PolySubstVal :: Maybe (Polynomial n) -> PolySubstVal (AtomNameC SimpIR) n
+  PolyRename   :: Name c n             -> PolySubstVal c n
+
+instance SinkableV PolySubstVal
+instance SinkableE (PolySubstVal c)  where sinkingProofE = undefined
+instance FromName PolySubstVal where fromName = PolyRename
+
+type BlockTraverserM i o a = SubstReaderT PolySubstVal (MaybeT1 (BuilderM SimpIR)) i o a
 
 blockAsPoly
   :: (EnvExtender m, EnvReader m)
-  => Block n -> m n (Maybe (Polynomial n))
+  => Block SimpIR n -> m n (Maybe (Polynomial n))
 blockAsPoly (Block _ decls result) =
   liftBuilder $ runMaybeT1 $ runSubstReaderT idSubst $ blockAsPolyRec decls result
 
-blockAsPolyRec :: Nest Decl i i' -> Atom i' -> BlockTraverserM i o (Polynomial o)
+blockAsPolyRec :: Nest (Decl SimpIR) i i' -> Atom SimpIR i' -> BlockTraverserM i o (Polynomial o)
 blockAsPolyRec decls result = case decls of
   Empty -> atomAsPoly result
   Nest (Let b (DeclBinding _ _ expr)) restDecls -> do
-    p <- toMaybeE <$> optional (exprAsPoly expr)
-    extendSubst (b@>SubstVal p) $ blockAsPolyRec restDecls result
+    p <- optional (exprAsPoly expr)
+    extendSubst (b@>PolySubstVal p) $ blockAsPolyRec restDecls result
 
   where
-    atomAsPoly :: Atom i -> BlockTraverserM i o (Polynomial o)
+    atomAsPoly :: Atom SimpIR i -> BlockTraverserM i o (Polynomial o)
     atomAsPoly = \case
-      Var v       -> varAsPoly v
+      Var v       -> atomNameAsPoly v
+      RepValAtom (RepVal _ (Leaf (IVar v' _))) -> impNameAsPoly v'
       IdxRepVal i -> return $ poly [((fromIntegral i) % 1, mono [])]
       _ -> empty
 
-    varAsPoly :: AtomName i -> BlockTraverserM i o (Polynomial o)
-    varAsPoly v = getSubst <&> (!v) >>= \case
-      SubstVal NothingE   -> empty
-      SubstVal (JustE cp) -> return cp
-      SubstVal _          -> error "impossible"
-      Rename   v'         ->
+    impNameAsPoly :: ImpName i -> BlockTraverserM i o (Polynomial o)
+    impNameAsPoly v = getSubst <&> (!v) >>= \case
+      PolyRename v' -> return $ poly [(1, mono [(RightE v', 1)])]
+
+    atomNameAsPoly :: AtomName SimpIR i -> BlockTraverserM i o (Polynomial o)
+    atomNameAsPoly v = getSubst <&> (!v) >>= \case
+      PolySubstVal Nothing   -> empty
+      PolySubstVal (Just cp) -> return cp
+      PolyRename   v'        ->
         getType v' >>= \case
-          IdxRepTy -> return $ poly [(1, mono [(v', 1)])]
+          IdxRepTy -> return $ poly [(1, mono [(LeftE v', 1)])]
           _ -> empty
 
-    exprAsPoly :: Expr i -> BlockTraverserM i o (Polynomial o)
+    exprAsPoly :: Expr SimpIR i -> BlockTraverserM i o (Polynomial o)
     exprAsPoly e = case e of
       Atom a -> atomAsPoly a
-      Op (BinOp op x y) -> case op of
+      PrimOp (BinOp op x y) -> case op of
         IAdd -> add <$> atomAsPoly x <*> atomAsPoly y
         IMul -> mul <$> atomAsPoly x <*> atomAsPoly y
         -- XXX: we rely on the wrapping behavior of subtraction on unsigned ints
@@ -167,7 +191,7 @@ blockAsPolyRec decls result = case decls of
 -- coefficients. This is why we have to find the least common multiples and do the
 -- accumulation over numbers multiplied by that LCM. We essentially do fixed point
 -- fractional math here.
-emitPolynomial :: (Emits n, Builder m) => Polynomial n -> m n (Atom n)
+emitPolynomial :: (Emits n, Builder SimpIR m) => Polynomial n -> m n (Atom SimpIR n)
 emitPolynomial (Polynomial p) = do
   let constLCM = asAtom $ foldl lcm 1 $ fmap (denominator . snd) $ toList p
   monoAtoms <- flip traverse (toList p) $ \(m, c) -> do
@@ -181,12 +205,16 @@ emitPolynomial (Polynomial p) = do
     --       because it might be causing overflows due to all arithmetic being shifted.
     asAtom = IdxRepVal . fromInteger
 
-emitMonomial :: (Emits n, Builder m) => Monomial n -> m n (Atom n)
+emitMonomial :: (Emits n, Builder SimpIR m) => Monomial n -> m n (Atom SimpIR n)
 emitMonomial (Monomial m) = do
-  varAtoms <- forM (toList m) \(v, e) -> ipow (Var v) e
+  varAtoms <- forM (toList m) \(v, e) -> case v of
+    LeftE v' -> ipow (Var v') e
+    RightE v' -> do
+      let atom = RepValAtom $ RepVal IdxRepTy (Leaf (IVar v' IIdxRepTy))
+      ipow atom e
   foldM imul (IdxRepVal 1) varAtoms
 
-ipow :: (Emits n, Builder m) => Atom n -> Int -> m n (Atom n)
+ipow :: (Emits n, Builder SimpIR m) => Atom SimpIR n -> Int -> m n (Atom SimpIR n)
 ipow x i = foldM imul (IdxRepVal 1) (replicate i x)
 
 -- === instances ===

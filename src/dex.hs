@@ -16,23 +16,28 @@ import System.Posix.Terminal (queryTerminal)
 import System.Posix.IO (stdOutput)
 import System.IO (openFile, IOMode (..))
 
+import qualified Data.ByteString as BS
 import Data.List
-import Data.Functor
 import qualified Data.Text as T
-import qualified Data.Text.IO as T
+import qualified Data.Text.Encoding as T
 import qualified Data.Map.Strict as M
 
 import PPrint (toJSONStr, printResult)
 import TopLevel
 import Err
-import Syntax
 import Name
-import Parser (parseTopDeclRepl, keyWordStrs, preludeImportBlock)
+import AbstractSyntax (parseTopDeclRepl)
+import ConcreteSyntax (keyWordStrs, preludeImportBlock)
 #ifdef DEX_LIVE
 import RenderHtml
 import Live.Terminal (runTerminal)
 import Live.Web (runWeb)
 #endif
+import Core
+import Types.Core
+import Types.Imp
+import Types.Misc
+import Types.Source
 
 data ErrorHandling = HaltOnErr | ContinueOnErr
 data DocFmt = ResultOnly
@@ -57,7 +62,7 @@ runMode evalMode opts = case evalMode of
   ScriptMode fname fmt onErr -> do
     env <- loadCache
     (litProg, finalEnv) <- runTopperM opts env do
-      source <- liftIO $ T.readFile fname
+      source <- liftIO $ T.decodeUtf8 <$> BS.readFile fname
       evalSourceText source (printIncrementalSource fmt) \result@(Result _ errs) -> do
         printIncrementalResult fmt result
         return case (onErr, errs) of (HaltOnErr, Failure _) -> False; _ -> True
@@ -193,12 +198,15 @@ optionList opts = eitherReader \s -> case lookup s opts of
   Just x  -> Right x
   Nothing -> Left $ "Bad option. Expected one of: " ++ show (map fst opts)
 
+enumOption :: String -> String -> a -> [(String, a)] -> Parser a
+enumOption optName prettyOptName defaultVal options = option
+  (optionList options)
+  (long optName <> value defaultVal <>
+     helpOption prettyOptName (intercalate " | " $ fst <$> options))
+
 parseEvalOpts :: Parser EvalConfig
 parseEvalOpts = EvalConfig
-  <$> option
-         (optionList backends)
-         (long "backend" <> value LLVM <>
-          helpOption "Backend" (intercalate " | " $ fst <$> backends))
+  <$> enumOption "backend" "Backend" LLVM backends
   <*> (option pathOption $ long "lib-path" <> value [LibBuiltinPath]
     <> metavar "PATH" <> help "Library path")
   <*> optional (strOption $ long "prelude" <> metavar "FILE" <> help "Prelude file")
@@ -207,7 +215,10 @@ parseEvalOpts = EvalConfig
                     <> help "File to log to" <> showDefault)
   <*> pure Nothing
   <*> flag NoOptimize Optimize (short 'O' <> help "Optimize generated code")
+  <*> enumOption "print" "Print backend" PrintCodegen printBackends
   where
+    printBackends = [ ("haskell", PrintHaskell)
+                    , ("dex"    , PrintCodegen) ]
     backends = [ ("llvm", LLVM)
                , ("llvm-mc", LLVMMC)
 #ifdef DEX_CUDA

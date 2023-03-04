@@ -1,3 +1,5 @@
+'# ODE Integrator
+
 'Integrate systems of ordinary differential equations (ODEs) using the Dormand-Prince method for adaptive integration
 stepsize calculation.
 This version is a port of the [Jax implementation](https://github.com/google/jax/blob/4236eb2b5929b9643977553f7f988ca518b7df4e/jax/experimental/ode.py).
@@ -56,13 +58,13 @@ def initial_step_size {d}
 -- Dopri5 Butcher tableaux
 alpha = [1. / 5., 3. / 10., 4. / 5., 8. / 9., 1., 1.]
 
-beta : (i:(Fin 6)=>(..i)=>Float) =  -- triangular array type.
-  [[1. / 5.],
-   [3. / 40., 9. / 40.],
-   [44. / 45., -56. / 15., 32.0 / 9.],
-   [19372. / 6561., -25360. / 2187., 64448. / 6561., -212. / 729.],
-   [9017./3168., -355./33., 46732./5247., 49./176., -5103./18656.],
-   [35. / 384., 0., 500. / 1113., 125./192., -2187./6784., 11./84.]]
+beta : ((i:Fin 6)=>(..i)=>Float) =  -- triangular array type.
+  [coerce_table _ [1. / 5.],
+   coerce_table _ [3. / 40., 9. / 40.],
+   coerce_table _ [44. / 45., -56. / 15., 32.0 / 9.],
+   coerce_table _ [19372. / 6561., -25360. / 2187., 64448. / 6561., -212. / 729.],
+   coerce_table _ [9017./3168., -355./33., 46732./5247., 49./176., -5103./18656.],
+   coerce_table _ [35. / 384., 0., 500. / 1113., 125./192., -2187./6784., 11./84.]]
 
 c_sol = [35. /384., 0., 500. /1113., 125. /192., -2187. /6784., 11. / 84., 0.]
 c_error =
@@ -166,7 +168,7 @@ def odeint {d n}
   init_carry = (z0, f0, t0, init_step, t0, init_interp_coeff)
   snd $ scan init_carry integrate_to_next_time
 
-'#### Example: Linear dynamics
+'## Example: Linear dynamics
 
 def myDyn {a} (z : a) (t:Time) : a = z
 
@@ -181,7 +183,7 @@ approx_e = odeint myDyn z0 t0 t1
 exact_e = [[exp 1.0]]
 
 :p (approx_e - exact_e) -- amount of numerical error
-> [[0.001894]]
+> [[0.001894474]]
 
 times = linspace (Fin 100) 0.00001 1.0
 ys = odeint myDyn z0 t0 times

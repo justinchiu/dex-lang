@@ -44,42 +44,51 @@ flag debug
   default:             False
 
 library
-  exposed-modules:     Algebra
+  exposed-modules:     AbstractSyntax
+                     , Algebra
                      , Builder
                      , CUDA
                      , Cat
                      , CheapReduction
                      , CheckType
+                     , ConcreteSyntax
                      , Core
                      , Err
                      , Export
                      , GenericTraversal
+                     , Generalize
                      , Imp
+                     , ImpToLLVM
                      , Inference
-                     , Interpreter
-                     , JIT
-                     , LLVM.HEAD.JIT
-                     , LLVM.JIT
+                     , Inline
+                     , IRVariants
+                     , LLVM.Link
+                     , LLVM.Compile
+                     , LLVM.CUDA
                      , LLVM.Shims
-                     , LLVMExec
                      , LabeledItems
+                     , Lexing
                      , Linearize
                      , Logging
                      , Lower
                      , MTL1
                      , Name
+                     , Occurrence
+                     , OccAnalysis
                      , Optimize
                      , PPrint
-                     , Parser
                      , RawName
+                     , Runtime
+                     , RuntimePrint
                      , Serialize
                      , Simplify
+                     , Subst
                      , SourceRename
-                     , Syntax
                      , TopLevel
                      , Transpose
                      , Types.Core
                      , Types.Imp
+                     , Types.Misc
                      , Types.Primitives
                      , Types.Source
                      , QueryType
@@ -120,6 +129,8 @@ library
                        -- Serialization
                      , aeson
                      , store
+                       -- Floating-point pedanticness (correcting for GHC < 9.2.2)
+                     , floating-bits
   if flag(live)
     build-depends:     binary
                      , blaze-html
@@ -274,6 +285,7 @@ foreign-library Dex
   ghc-options:         -Wall
                        -fPIC
                        -optP-Wno-nonportable-include-path
+                       -Wno-unticked-promoted-constructors
   default-language:    Haskell2010
   default-extensions:  BlockArguments
                      , DataKinds
@@ -295,11 +307,18 @@ test-suite spec
   main-is:             Spec.hs
   hs-source-dirs:      tests/unit
   ghc-options:         -Wall
+                       -Wno-unticked-promoted-constructors
   build-depends:       base
+                     , containers
                      , hspec
+                     , mtl
                      , QuickCheck
+                     , text
                      , dex
-  other-modules:       RawNameSpec
+  other-modules:       ConstantCastingSpec
+                     , OccAnalysisSpec
+                     , OccurrenceSpec
+                     , RawNameSpec
   default-language:    Haskell2010
   build-tool-depends:  hspec-discover:hspec-discover
                        -- Mimicking -XGHC2021 in GHC 8.10.1

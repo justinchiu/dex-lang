@@ -5,22 +5,145 @@ def id' (x:Int) : Int = x
 "dce-dead-app"
 
 %passes opt
-:p
+:pp
   x = id' 1
   5 + 1
+-- First Result is from optimizing id'
 -- CHECK: === Result ===
--- CHECK-NEXT: 6
+-- CHECK: === Result ===
+-- CHECK-NEXT: 0x6
 
 def arange_f {n} (off:Nat) : (Fin n)=>Int = for i. id' $ (n_to_i $ ordinal i + off)
+
+
+-- CHECK-LABEL: matmul-single-alloc
+"matmul-single-alloc"
+m = for i:(Fin 100) j:(Fin 100). n_to_f $ ordinal (i, j)
+
+%passes imp
+m' = m ** m
+-- CHECK: alloc Float32[10000]
+-- CHECK-NOT: alloc
+
+"basic destination passing for scalar array literals"
+-- CHECK-LABEL: basic destination passing for scalar array literals
+
+%passes lower
+_ = for i:(Fin 50). [ordinal i, 2, 3]
+-- CHECK-NOT: alloc
+
+"no destinations for singleton values"
+-- CHECK-LABEL: no destinations for singleton values
+
+%passes lower
+:pp yield_state 0 \ref.
+  for i:(Fin 10). ref := get ref + 1
+-- CHECK-NOT: alloc
+
+-- === Loop unrolling ===
 
 -- CHECK-LABEL: unroll-eliminate-table
 "unroll-eliminate-table"
 
 %passes opt
-:p
+:pp
   [x0, x1, x2] = arange_f 2
   (x0, x2)
 -- CHECK: === Result ===
--- CHECK: [[x0:.*]]:Int32 = id{{.*}} 2
--- CHECK-NEXT: [[x2:.*]]:Int32 = id{{.*}} 4
+-- CHECK: [[x0:[^ ]*]]:Int32 = id{{.*}} 2
+-- CHECK-NEXT: [[x2:[^ ]*]]:Int32 = id{{.*}} 4
 -- CHECK-NEXT: ([[x0]], [[x2]])
+
+"don't unroll large table literals"
+-- CHECK-LABEL: don't unroll large table literals
+
+%passes opt
+x = for i:(Fin 4). [0, 0, 0, ordinal i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+-- CHECK: [ 0x0
+-- CHECK: , 0x0 ]
+-- CHECK-NOT: [0x0
+
+"no excessive nested unrolling"
+-- CHECK-LABEL: no excessive nested unrolling
+
+%passes opt
+_ = for i:(Fin 20) j:(Fin 4). ordinal j
+-- CHECK: [0x0, 0x1, 0x2, 0x3]
+-- CHECK-NOT: [0x0, 0x1, 0x2, 0x3]
+
+"no excessive atom body unrolling"
+-- CHECK-LABEL: no excessive atom body unrolling
+
+one_f32 : Float32 = 1.0
+
+%passes simp
+_ = for i:(Fin 100). one_f32
+-- CHECK: 1.
+-- CHECK-NOT: 1.
+
+-- === Loop invariant code motion ===
+
+"alloc hoisting"
+-- CHECK-LABEL: alloc hoisting
+
+%passes lower-opt
+_ = for i:(Fin 10).
+  n = ordinal i + 2
+  for j:(Fin 4).
+    xs = for k:(Fin n). ordinal j
+    (sum xs, sum xs)  -- Two uses of xs to defeat the inliner
+-- The alloc for the (ordinal i + 2)-sized array should happen in the i loop,
+-- not in the j loop
+-- CHECK: [[n:v#[0-9]+]]:Word32 = %iadd {{.*}} 0x2
+-- CHECK-NOT: seq
+-- CHECK: alloc {{.*}}RawFin{{.*}}[[n]]
+-- CHECK: seq
+-- CHECK: seq
+
+"loop hoisting"
+-- CHECK-LABEL: loop hoisting
+
+%passes opt
+_ = for i:(Fin 20) j:(Fin 4). ordinal j
+-- CHECK-NOT: for
+-- CHECK: [[x:v#[0-9]+]]:{{.*}} = [0x0, 0x1, 0x2, 0x3]
+-- CHECK: for {{.*}}:{{.*}}. [[x]]
+
+-- === Peephole optimization ===
+
+"constant fold boolean expressions"
+-- CHECK-LABEL: constant fold boolean expressions
+
+%passes opt
+:pp (2 > 1 || 4 < 5) && 6 == 6
+-- CHECK: (1| () |)
+
+"vectorization"
+-- CHECK-LABEL: vectorization
+
+%passes vect
+_ = for i:(Fin 256). (n_to_i32 (ordinal i)) + 1
+-- CHECK: seq (RawFin 0x10)
+-- CHECK: [[i0:v#[0-9]+]]:<16xInt32> = vbroadcast
+-- CHECK: [[i1:v#[0-9]+]]:<16xInt32> = viota
+-- CHECK: [[i2:v#[0-9]+]]:<16xInt32> = %iadd [[i0]] [[i1]]
+-- CHECK: [[ones:v#[0-9]+]]:<16xInt32> = vbroadcast 1
+-- CHECK: %iadd [[i2]] [[ones]]
+
+%passes vect
+_ = for i:(Fin 256). (n_to_f32 (ordinal i)) + 1
+-- CHECK: seq (RawFin 0x10)
+-- CHECK: [[i0:v#[0-9]+]]:<16xFloat32> = vbroadcast
+-- CHECK: [[i1:v#[0-9]+]]:<16xFloat32> = viota
+-- CHECK: [[i2:v#[0-9]+]]:<16xFloat32> = %fadd [[i0]] [[i1]]
+-- CHECK: [[ones:v#[0-9]+]]:<16xFloat32> = vbroadcast 1.
+-- CHECK: %fadd [[i2]] [[ones]]
+
+%passes vect
+_ = for i:(Fin 256). (n_to_f64 (ordinal i)) + 1
+-- CHECK: seq (RawFin 0x20)
+-- CHECK: [[i0:v#[0-9]+]]:<8xFloat64> = vbroadcast
+-- CHECK: [[i1:v#[0-9]+]]:<8xFloat64> = viota
+-- CHECK: [[i2:v#[0-9]+]]:<8xFloat64> = %fadd [[i0]] [[i1]]
+-- CHECK: [[ones:v#[0-9]+]]:<8xFloat64> = vbroadcast 1.
+-- CHECK: %fadd [[i2]] [[ones]]

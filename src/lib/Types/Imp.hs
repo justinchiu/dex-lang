@@ -20,8 +20,10 @@
 
 module Types.Imp where
 
+import Foreign.Ptr
 import Data.Hashable
 import qualified Data.ByteString.Char8 as B
+import qualified Data.ByteString       as BS
 
 import GHC.Generics (Generic (..))
 import Data.Store (Store (..))
@@ -31,26 +33,23 @@ import Util (IsBool (..))
 
 import Types.Primitives
 
--- We use AtomName because we convert between atoms and imp
--- expressions without chaning names. Maybe we shouldn't do that.
-type ImpName = Name AtomNameC
+type ImpName = Name ImpNameC
 
-type ImpFunName = Name ImpFunNameC
+type ImpFunName = Name TopFunNameC
 data IExpr n = ILit LitVal
              | IVar (ImpName n) BaseType
+             | IPtrVar (Name PtrNameC n) PtrType
                deriving (Show, Generic)
 
-data IBinder n l = IBinder (NameBinder AtomNameC n l) IType
+data IBinder n l = IBinder (NameBinder ImpNameC n l) IType
                    deriving (Show, Generic)
 
-type IPrimOp n = PrimOp (IExpr n)
 type IVal = IExpr  -- only ILit and IRef constructors
 type IType = BaseType
 type Size = IExpr
 type IVectorType = BaseType -- has to be a vector type
 
 type IFunName = String
-
 type IFunVar = (IFunName, IFunType)
 data IFunType = IFunType CallingConvention [IType] [IType] -- args, results
                 deriving (Show, Eq, Generic)
@@ -62,19 +61,24 @@ instance IsBool IsCUDARequired where
   toBool CUDANotRequired = False
 
 data CallingConvention =
-   CEntryFun
- | CInternalFun
- | EntryFun IsCUDARequired
- | FFIFun
- | FFIMultiResultFun
+   -- Scalar args by value, arrays by pointer, dests allocated by caller and passed as pointers.
+   -- Used for standalone functions and for functions called from Python without XLA.
+   StandardCC
+   -- Used for functions called from within an XLA computation.
+ | XLACC
+   -- Dests allocated within the function and passed back to the caller (packed
+   -- in a number-of-results-length buffer supplied by the caller)
+ | EntryFunCC IsCUDARequired
+   -- Scalars only. Args as args, result as result. Used for calling C function
+   -- from Dex that return a single scalar.
+ | FFICC
+ | FFIMultiResultCC
  | CUDAKernelLaunch
  | MCThreadLaunch
    deriving (Show, Eq, Generic)
 
-data ImpFunction n =
-   ImpFunction IFunType (Abs (Nest IBinder) ImpBlock n)
- | FFIFunction IFunType IFunName
-   deriving (Show, Generic)
+data ImpFunction n = ImpFunction IFunType (Abs (Nest IBinder) ImpBlock n)
+     deriving (Show, Generic)
 
 data ImpBlock n where
   ImpBlock :: Nest ImpDecl n l -> [IExpr l] -> ImpBlock n
@@ -93,13 +97,24 @@ data ImpInstr n =
  | ICall (ImpFunName n) [IExpr n]
  | Store (IExpr n) (IExpr n)           -- dest, val
  | Alloc AddressSpace IType (Size n)
+ | StackAlloc IType (Size n)
  | MemCopy (IExpr n) (IExpr n) (IExpr n)   -- dest, source, numel
  | Free (IExpr n)
+ | InitializeZeros (IExpr n) (IExpr n)  -- ptr, numel
+ | GetAllocSize (IExpr n)  -- gives size in numel
  | IThrowError  -- TODO: parameterize by a run-time string
  | ICastOp IType (IExpr n)
- | IPrimOp (IPrimOp n)
+ | IBitcastOp IType (IExpr n)
  | IVectorBroadcast (IExpr n) IVectorType
  | IVectorIota                IVectorType
+ | IPtrLoad (IExpr n)
+ | IPtrOffset (IExpr n) (IExpr n)
+ | IBinOp BinOp (IExpr n) (IExpr n)
+ | IUnOp  UnOp  (IExpr n)
+ | ISelect (IExpr n) (IExpr n) (IExpr n)
+ | IOutputStream
+ | DebugPrint String (IExpr n) -- just prints an int64 value
+ | IShowScalar (IExpr n) (IExpr n) -- pointer to result table, value
    deriving (Show, Generic)
 
 iBinderType :: IBinder n l -> IType
@@ -108,6 +123,88 @@ iBinderType (IBinder _ ty) = ty
 
 data Backend = LLVM | LLVMCUDA | LLVMMC | MLIR | Interpreter  deriving (Show, Eq)
 newtype CUDAKernel = CUDAKernel B.ByteString deriving (Show)
+
+-- === Closed Imp functions, LLVM and object file representation ===
+
+-- Object files and LLVM modules expose ordinary C-toolchain names rather than
+-- our internal scoped naming system. The `CNameInterface` data structure
+-- describes how to interpret the names exposed by an LLVM module and its
+-- corresponding object code. These names are all considered local to the
+-- module. The module as a whole is a closed object corresponding to a
+-- `ClosedImpFunction`.
+
+-- TODO: consider adding more information here: types of required functions,
+-- calling conventions etc.
+type CName = String
+data WithCNameInterface a = WithCNameInterface
+  { cniCode         :: a       -- module itself (an LLVM.AST.Module or a bytestring of object code)
+  , cniMainFunName  :: CName   -- name of function defined in this module
+  , cniRequiredFuns :: [CName] -- names of functions required by this module
+  , cniRequiredPtrs :: [CName] -- names of data pointers
+  , cniDtorList     :: [CName] -- names of destructors (CUDA only) defined by this module
+  } deriving (Show, Generic, Functor, Foldable, Traversable)
+
+type RawObjCode = BS.ByteString
+type FunObjCode = WithCNameInterface RawObjCode
+
+data IFunBinder n l = IFunBinder (NameBinder TopFunNameC n l) IFunType
+
+-- Imp function with link-time objects abstracted out, suitable for standalone
+-- compilation. TODO: enforce actual `VoidS` as the scope parameter.
+data ClosedImpFunction n where
+  ClosedImpFunction
+    :: Nest IFunBinder n1 n2 -- binders for required functions
+    -> Nest PtrBinder  n2 n3 -- binders for required data pointers
+    -> ImpFunction n3
+    -> ClosedImpFunction n1
+
+data PtrBinder n l = PtrBinder (NameBinder PtrNameC n l) PtrType
+data LinktimeNames n = LinktimeNames [Name FunObjCodeNameC n] [Name PtrNameC n]  deriving (Show, Generic)
+data LinktimeVals    = LinktimeVals  [FunPtr ()] [Ptr ()]                        deriving (Show, Generic)
+
+instance BindsAtMostOneName IFunBinder TopFunNameC where
+  IFunBinder b _ @> x = b @> x
+  {-# INLINE (@>) #-}
+
+instance BindsOneName IFunBinder TopFunNameC where
+  binderName (IFunBinder b _) = binderName b
+  {-# INLINE binderName #-}
+
+instance HasNameHint (IFunBinder n l) where
+  getNameHint (IFunBinder b _) = getNameHint b
+
+instance GenericB IFunBinder where
+  type RepB IFunBinder = BinderP TopFunNameC (LiftE IFunType)
+  fromB (IFunBinder b ty) = b :> LiftE ty
+  toB   (b :> LiftE ty) = IFunBinder b ty
+
+instance ProvesExt  IFunBinder
+instance BindsNames IFunBinder
+instance SinkableB IFunBinder
+instance HoistableB  IFunBinder
+instance RenameB     IFunBinder
+instance AlphaEqB IFunBinder
+instance AlphaHashableB IFunBinder
+
+instance GenericB PtrBinder where
+  type RepB PtrBinder = BinderP PtrNameC (LiftE PtrType)
+  fromB (PtrBinder b ty) = b :> LiftE ty
+  toB   (b :> LiftE ty) = PtrBinder b ty
+
+instance BindsAtMostOneName PtrBinder PtrNameC where
+  PtrBinder b _ @> x = b @> x
+  {-# INLINE (@>) #-}
+
+instance HasNameHint (PtrBinder n l) where
+  getNameHint (PtrBinder b _) = getNameHint b
+
+instance ProvesExt   PtrBinder
+instance BindsNames  PtrBinder
+instance SinkableB   PtrBinder
+instance HoistableB  PtrBinder
+instance RenameB     PtrBinder
+instance AlphaEqB    PtrBinder
+instance AlphaHashableB PtrBinder
 
 -- === instances ===
 
@@ -123,19 +220,29 @@ instance GenericE ImpInstr where
   {- ILaunch -} (LiftE IFunVar `PairE` Size `PairE` ListE IExpr)
   {- ICall -}   (ImpFunName `PairE` ListE IExpr)
   {- Store -}   (IExpr `PairE` IExpr)
-    ) (EitherE4
+    ) (EitherE7
   {- Alloc -}   (LiftE (AddressSpace, IType) `PairE` Size)
+  {- StackAlloc -} (LiftE IType `PairE` Size)
   {- MemCopy -} (IExpr `PairE` IExpr `PairE` IExpr)
+  {- InitializeZeros -}  (IExpr `PairE` IExpr)
+  {- GetAllocSize -} IExpr
   {- Free -}    (IExpr)
   {- IThrowE -} (UnitE)
-    ) (EitherE2
-  {- ICastOp -} (LiftE IType `PairE` IExpr)
-  {- IPrimOp -} (ComposeE PrimOp IExpr)
-    ) (EitherE2
+    ) (EitherE6
+  {- ICastOp    -} (LiftE IType `PairE` IExpr)
+  {- IBitcastOp -} (LiftE IType `PairE` IExpr)
   {- IVectorBroadcast -} (IExpr `PairE` LiftE IVectorType)
   {- IVectorIota      -} (              LiftE IVectorType)
+  {- DebugPrint       -} (LiftE String `PairE` IExpr)
+  {- IShowScalar      -} (IExpr `PairE` IExpr)
+    ) (EitherE6
+  {- IPtrLoad -}      IExpr
+  {- IPtrOffset -}    (IExpr `PairE` IExpr)
+  {- IBinOp -}        (LiftE BinOp `PairE` IExpr `PairE` IExpr)
+  {- IUnOp -}         (LiftE UnOp `PairE` IExpr)
+  {- ISelect -}       (IExpr`PairE` IExpr `PairE`IExpr)
+  {- IOutputStream -} UnitE
     )
-
 
   fromE instr = case instr of
     IFor d n ab           -> Case0 $ Case0 $ LiftE d `PairE` n `PairE` ab
@@ -149,14 +256,26 @@ instance GenericE ImpInstr where
     Store dest val      -> Case1 $ Case3 $ dest `PairE` val
 
     Alloc a t s            -> Case2 $ Case0 $ LiftE (a, t) `PairE` s
-    MemCopy dest src numel -> Case2 $ Case1 $ dest `PairE` src `PairE` numel
-    Free ptr               -> Case2 $ Case2 ptr
-    IThrowError            -> Case2 $ Case3 UnitE
+    StackAlloc t s         -> Case2 $ Case1 $ LiftE t `PairE` s
+    MemCopy dest src numel -> Case2 $ Case2 $ dest `PairE` src `PairE` numel
+    InitializeZeros ptr numel -> Case2 $ Case3 $ ptr `PairE` numel
+    GetAllocSize ptr       -> Case2 $ Case4 $ ptr
+    Free ptr               -> Case2 $ Case5 ptr
+    IThrowError            -> Case2 $ Case6 UnitE
 
-    ICastOp idt ix -> Case3 $ Case0 $ LiftE idt `PairE` ix
-    IPrimOp op     -> Case3 $ Case1 $ ComposeE op
-    IVectorBroadcast v vty -> Case4 $ Case0 $ v `PairE` LiftE vty
-    IVectorIota vty        -> Case4 $ Case1 $ LiftE vty
+    ICastOp idt ix         -> Case3 $ Case0 $ LiftE idt `PairE` ix
+    IBitcastOp idt ix      -> Case3 $ Case1 $ LiftE idt `PairE` ix
+    IVectorBroadcast v vty -> Case3 $ Case2 $ v `PairE` LiftE vty
+    IVectorIota vty        -> Case3 $ Case3 $ LiftE vty
+    DebugPrint s x         -> Case3 $ Case4 $ LiftE s `PairE` x
+    IShowScalar x  y       -> Case3 $ Case5 $ x `PairE` y
+
+    IPtrLoad x     -> Case4 $ Case0 $ x
+    IPtrOffset x y -> Case4 $ Case1 $ x `PairE` y
+    IBinOp op x y  -> Case4 $ Case2 $ LiftE op `PairE` x `PairE` y
+    IUnOp op x     -> Case4 $ Case3 $ LiftE op `PairE` x
+    ISelect x y z  -> Case4 $ Case4 $ x `PairE` y `PairE` z
+    IOutputStream  -> Case4 $ Case5 $ UnitE
   {-# INLINE fromE #-}
 
   toE instr = case instr of
@@ -176,19 +295,21 @@ instance GenericE ImpInstr where
 
     Case2 instr' -> case instr' of
       Case0 (LiftE (a, t) `PairE` s )         -> Alloc a t s
-      Case1 (dest `PairE` src `PairE` numel)  -> MemCopy dest src numel
-      Case2 ptr                               -> Free ptr
-      Case3 UnitE                             -> IThrowError
+      Case1 (LiftE t `PairE` s )              -> StackAlloc t s
+      Case2 (dest `PairE` src `PairE` numel)  -> MemCopy dest src numel
+      Case3 (ptr `PairE` numel)               -> InitializeZeros ptr numel
+      Case4 ptr                               -> GetAllocSize ptr
+      Case5 ptr                               -> Free ptr
+      Case6 UnitE                             -> IThrowError
       _ -> error "impossible"
 
     Case3 instr' -> case instr' of
       Case0 (LiftE idt `PairE` ix ) -> ICastOp idt ix
-      Case1 (ComposeE op )          -> IPrimOp op
-      _ -> error "impossible"
-
-    Case4 instr' -> case instr' of
-      Case0 (v `PairE` LiftE vty) -> IVectorBroadcast v vty
-      Case1 (          LiftE vty) -> IVectorIota vty
+      Case1 (LiftE idt `PairE` ix ) -> IBitcastOp idt ix
+      Case2 (v `PairE` LiftE vty) -> IVectorBroadcast v vty
+      Case3 (          LiftE vty) -> IVectorIota vty
+      Case4 (LiftE s `PairE` x)   -> DebugPrint s x
+      Case5 (x `PairE` y)         -> IShowScalar x y
       _ -> error "impossible"
 
     _ -> error "impossible"
@@ -198,7 +319,7 @@ instance SinkableE ImpInstr
 instance HoistableE  ImpInstr
 instance AlphaEqE ImpInstr
 instance AlphaHashableE ImpInstr
-instance SubstE Name ImpInstr
+instance RenameE     ImpInstr
 
 instance GenericE ImpBlock where
   type RepE ImpBlock = Abs (Nest ImpDecl) (ListE IExpr)
@@ -211,20 +332,23 @@ instance SinkableE ImpBlock
 instance HoistableE  ImpBlock
 instance AlphaEqE ImpBlock
 instance AlphaHashableE ImpBlock
-instance SubstE Name ImpBlock
+instance RenameE     ImpBlock
 deriving via WrapE ImpBlock n instance Generic (ImpBlock n)
 
 instance GenericE IExpr where
-  type RepE IExpr = EitherE2 (LiftE LitVal)
-                             (PairE ImpName (LiftE BaseType))
+  type RepE IExpr = EitherE3 (LiftE LitVal)
+                             (PairE ImpName         (LiftE BaseType))
+                             (PairE (Name PtrNameC) (LiftE PtrType))
   fromE iexpr = case iexpr of
-    ILit x -> Case0 (LiftE x)
-    IVar v ty -> Case1 (v `PairE` LiftE ty)
+    ILit x       -> Case0 (LiftE x)
+    IVar    v ty -> Case1 (v `PairE` LiftE ty)
+    IPtrVar v ty -> Case2 (v `PairE` LiftE ty)
   {-# INLINE fromE #-}
 
   toE rep = case rep of
     Case0 (LiftE x) -> ILit x
-    Case1 (v `PairE` LiftE ty) -> IVar v ty
+    Case1 (v `PairE` LiftE ty) -> IVar    v ty
+    Case2 (v `PairE` LiftE ty) -> IPtrVar v ty
     _ -> error "impossible"
   {-# INLINE toE #-}
 
@@ -232,20 +356,20 @@ instance SinkableE IExpr
 instance HoistableE  IExpr
 instance AlphaEqE IExpr
 instance AlphaHashableE IExpr
-instance SubstE Name IExpr
+instance RenameE     IExpr
 
 instance GenericB IBinder where
-  type RepB IBinder = PairB (LiftB (LiftE IType)) (NameBinder AtomNameC)
+  type RepB IBinder = PairB (LiftB (LiftE IType)) (NameBinder ImpNameC)
   fromB (IBinder b ty) = PairB (LiftB (LiftE ty)) b
   toB   (PairB (LiftB (LiftE ty)) b) = IBinder b ty
 
 instance HasNameHint (IBinder n l) where
   getNameHint (IBinder b _) = getNameHint b
 
-instance BindsAtMostOneName IBinder AtomNameC where
+instance BindsAtMostOneName IBinder ImpNameC where
   IBinder b _ @> x = b @> x
 
-instance BindsOneName IBinder AtomNameC where
+instance BindsOneName IBinder ImpNameC where
   binderName (IBinder b _) = binderName b
 
 instance BindsNames IBinder where
@@ -254,7 +378,7 @@ instance BindsNames IBinder where
 instance ProvesExt  IBinder
 instance SinkableB IBinder
 instance HoistableB  IBinder
-instance SubstB Name IBinder
+instance RenameB  IBinder
 instance AlphaEqB IBinder
 instance AlphaHashableB IBinder
 
@@ -265,34 +389,45 @@ instance GenericB ImpDecl where
 
 instance SinkableB ImpDecl
 instance HoistableB  ImpDecl
-instance SubstB Name ImpDecl
+instance RenameB     ImpDecl
 instance AlphaEqB ImpDecl
 instance AlphaHashableB ImpDecl
 instance ProvesExt  ImpDecl
 instance BindsNames ImpDecl
 
 instance GenericE ImpFunction where
-  type RepE ImpFunction = EitherE2 (LiftE IFunType `PairE` Abs (Nest IBinder) ImpBlock)
-                                   (LiftE (IFunType, IFunName))
-  fromE f = case f of
-    ImpFunction ty ab   -> Case0 $ LiftE ty `PairE` ab
-    FFIFunction ty name -> Case1 $ LiftE (ty, name)
+  type RepE ImpFunction = LiftE IFunType `PairE` Abs (Nest IBinder) ImpBlock
+  fromE (ImpFunction ty ab) =LiftE ty `PairE` ab
   {-# INLINE fromE #-}
 
-  toE f = case f of
-    Case0 (LiftE ty `PairE` ab) -> ImpFunction ty ab
-    Case1 (LiftE (ty, name))    -> FFIFunction ty name
-    _ -> error "impossible"
+  toE (LiftE ty `PairE` ab) = ImpFunction ty ab
   {-# INLINE toE #-}
 
 instance SinkableE ImpFunction
 instance HoistableE  ImpFunction
 instance AlphaEqE    ImpFunction
 instance AlphaHashableE    ImpFunction
-instance SubstE Name ImpFunction
+instance RenameE     ImpFunction
+
+
+instance GenericE LinktimeNames where
+  type RepE LinktimeNames = ListE  (Name FunObjCodeNameC)
+                   `PairE`  ListE  (Name PtrNameC)
+  fromE (LinktimeNames funs ptrs) = ListE funs `PairE` ListE ptrs
+  {-# INLINE fromE #-}
+
+  toE (ListE funs `PairE` ListE ptrs) = LinktimeNames funs ptrs
+  {-# INLINE toE #-}
+
+instance SinkableE      LinktimeNames
+instance HoistableE     LinktimeNames
+instance AlphaEqE       LinktimeNames
+instance AlphaHashableE LinktimeNames
+instance RenameE        LinktimeNames
 
 instance Store IsCUDARequired
 instance Store CallingConvention
+instance Store a => Store (WithCNameInterface a)
 instance Store (IBinder n l)
 instance Store (ImpDecl n l)
 instance Store (IFunType)
@@ -300,6 +435,8 @@ instance Store (ImpInstr n)
 instance Store (IExpr n)
 instance Store (ImpBlock n)
 instance Store (ImpFunction n)
+instance Store (LinktimeNames n)
+instance Store LinktimeVals
 
 instance Hashable IsCUDARequired
 instance Hashable CallingConvention

@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+
+# This script constructs a Markdown file (on standard output) that constitutes
+# an index of all web-rendered pages of Dex examples, documentation, and
+# libraries.
+
+# The rendered HTML of the index is meant to be placed at the root of the Dex
+# page tree, so that relative links work.
+
+# The script accepts three arguments:
+# - One argument containing a space-separated list of documentation files
+# - One argument containing a space-separated list of example files
+# - One argument containing a space-separated list of library files
+
+# TODO: Right now, the indexing script requires every file to have a single
+# title, identified by having a "'# <title>" line in the Dex source.  We should
+# detect when a file lacks such a title and fail loudly, instead of just
+# omitting that file from the index.
+
+import re
+import sys
+
+def file_block(files):
+  for fname in files:
+    if fname.startswith("doc/"):
+      link_name = fname[len("doc/"):-len(".dx")]
+    else:
+      link_name = fname[:-len(".dx")]
+    with open(fname, 'r') as f:
+      line = f.readline()
+      title = re.match(r"' *# ?(.*)", line)
+      if title:
+        print(f"- [{fname}]({link_name}.html) {title.group(1)}")
+      else:
+        raise ValueError(f"First line of file {fname} was not a title (top-level Markdown heading)")
+
+def main():
+  docs, examples, libraries = sys.argv[1:4]
+
+  print("# InDex"); print("")
+
+  print("## Documentation"); print("")
+
+  file_block(docs.split())
+
+  print(""); print("## Examples"); print("")
+
+  file_block(examples.split())
+
+  print(""); print("## Libraries"); print("")
+
+  print("- [lib/prelude.dx](prelude.html): The Dex Prelude (automatically imported)")
+
+  file_block(libraries.split())
+
+
+if __name__ == '__main__':
+  main()
