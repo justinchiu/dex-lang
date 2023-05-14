@@ -16,8 +16,8 @@ emit: States => Vocab => Float = for i. logsoftmax $ arb emit_key
 :t emit
 
 logsumexp start == zero
-(for i. logsumexp trans.i) == zero
-(for i. logsumexp emit.i) == zero
+(for i. logsumexp trans[i]) == zero
+(for i. logsumexp emit[i]) == zero
 
 -- Sample observations
 Batch = Fin 16
@@ -30,77 +30,77 @@ words: Observations = for time batch.
 -- better would be to just sample from cat
 
 :t words
-maximum $ for (i, j). words.i.j
-minimum $ for (i, j). words.i.j
+maximum $ for i j. words[i,j]
+minimum $ for i j. words[i,j]
 
 -- Test types
 :t start
 :t emit
-first_alpha = for batch. for z. start.z + emit.z.(words.(0@Time).batch@Vocab)
+first_alpha = for batch:Batch. for z:States. start[z] + emit[z,words[0@Time,batch]@Vocab]
 :t first_alpha
-:t for batch. logsoftmax first_alpha.batch
-this_alpha = for batch next. emit.next.((words.(1@Time).batch)@Vocab) + (logsumexp $
-  for prev. first_alpha.batch.prev + trans.prev.next)
+:t for batch. logsoftmax first_alpha[batch]
+this_alpha = for batch next. emit[next,words[1@Time,batch]@Vocab] + (logsumexp $
+  for prev. first_alpha[batch,prev] + trans[prev,next])
 :t this_alpha
 
 -- Forward Algo: renormalize at each timestep
-def forward (x: Observations): (Batch => Float) =
+def forward(x: Observations) -> Batch => Float =
   -- time == 0
-  first_alpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
+  first_alpha = for batch. for z. start[z] + emit[z,(head x)[batch]@Vocab]
   -- time > 0
   xs = slice x 1 _
-  with_state (for batch. logsumexp first_alpha.batch) $ \evidence.
-    with_state (for batch. logsoftmax first_alpha.batch) $ \alpha.
+  with_state (for batch. logsumexp first_alpha[batch]) $ \evidence.
+    with_state (for batch. logsoftmax first_alpha[batch]) $ \alpha.
       for time.
         -- Transition then sum over previous timestep
-        this_alpha = for batch next. emit.next.(xs.batch.time@Vocab) + (logsumexp $
-          for prev. (get alpha).batch.prev + trans.prev.next)
+        this_alpha = for batch next. emit[next,(xs[batch,time]@Vocab) + (logsumexp $
+          for prev. (get alpha)[batch,prev] + trans[prev,next])
         -- Sum over states and accumulate evidence
-        evidence := for batch. (get evidence).batch + logsumexp this_alpha.batch
+        evidence := for batch. (get evidence)[batch] + logsumexp this_alpha[batch]
         -- Renormalize, not necessary in log space
-        alpha := for batch. logsoftmax this_alpha.batch
+        alpha := for batch. logsoftmax this_alpha[batch]
     get evidence
 
-evidence = forward words
+evidence = forward(words)
 :t evidence
 
 -- Forward Algo: simple
-def forward2 (x: Observations): (Batch => Float) =
+def forward2(x: Observations) -> Batch => Float =
   -- time == 0
-  first_alpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
+  first_alpha = for batch. for z. start[z] + emit[z,(head x)[batch]@Vocab]
   -- time > 0
   xs = slice x 1 _
   with_state first_alpha $ \alpha.
     for time.
       -- Transition then sum over previous timestep
-      alpha := for batch next. emit.next.(xs.batch.time@Vocab) + (logsumexp $
-        for prev. (get alpha).batch.prev + trans.prev.next)
+      alpha := for batch next. emit[next,xs[batch,time]@Vocab] + (logsumexp $
+        for prev. (get alpha)[batch,prev] + trans[prev,next])
     -- Sum over states
-    for batch. logsumexp (get alpha).batch
+    for batch. logsumexp (get alpha)[batch]
 
-evidence2 = forward2 words
+evidence2 = forward2(words)
 :t evidence2
 
 evidence ~~ evidence2
 
 -- Forward Algo: matmul
-def forward3 (x: Observations): (Batch => Float) =
+def forward3(x: Observations) -> Batch => Float =
   p_trans = exp trans
   -- time == 0
-  first_alpha = for batch. for z. start.z + emit.z.((head x).batch@Vocab)
+  first_alpha = for batch. for z. start[z] + emit[z,(head x)[batch]@Vocab]
   -- time > 0
   xs = slice x 1 _
-  with_state (for batch. logsumexp first_alpha.batch) $ \evidence.
-    with_state (for batch. softmax first_alpha.batch) $ \alpha.
+  with_state (for batch. logsumexp first_alpha[batch]) $ \evidence.
+    with_state (for batch. softmax first_alpha[batch]) $ \alpha.
       for time.
         -- Transition and sum over prev states
         p_state = log $ (get alpha) ** p_trans
         -- Incorporate emissions
-        this_alpha = for batch next. emit.next.(xs.batch.time@Vocab) + p_state.batch.next
+        this_alpha = for batch next. emit[next,xs[batch,time]@Vocab] + p_state[batch,next]
         -- Sum over current states and accumulate evidence
-        evidence := for batch. (get evidence).batch + logsumexp this_alpha.batch
+        evidence := for batch. (get evidence)[batch] + logsumexp this_alpha[batch]
         -- Renormalize for stability
-        alpha := for batch. softmax this_alpha.batch
+        alpha := for batch. softmax this_alpha[batch]
     get evidence
 
 evidence3 = forward3 words
