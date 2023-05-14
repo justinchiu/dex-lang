@@ -33,9 +33,9 @@ import GHC.Generics (Generic (..))
 import Data.Store (Store (..))
 
 import Name
+import qualified Types.OpNames as P
 import IRVariants
 import Err
-import LabeledItems
 import Util (File (..))
 
 import Types.Primitives
@@ -62,19 +62,29 @@ pattern SIInternalName n a = SourceOrInternalName (InternalName n a)
 -- === Concrete syntax ===
 -- The grouping-level syntax of the source language
 
+-- optional arrow, effects, result type
+type ExplicitParams = [Group]
+type GivenClause = ([Group], Maybe [Group])  -- implicits, classes
+type WithClause  = [Group] -- no classes because we don't want to carry class dicts at runtime
+
 type CTopDecl = WithSrc CTopDecl'
 data CTopDecl'
-  = CSDecl LetAnn CSDecl
-  | CData SourceName -- Type constructor name
-      [Group] -- Arguments, including class constraints
-      [NameAndArgs] -- Constructor names and argument sets
-  | CStruct SourceName -- Type constructor name
-      [Group] -- Arguments, including class constraints
+  = CSDecl LetAnn CSDecl'
+  | CData
+      SourceName      -- Type constructor name
+      ExplicitParams
+      (Maybe GivenClause)
+      [(SourceName, ExplicitParams)]   -- Constructor names and argument sets
+  | CStruct
+      SourceName      -- Type constructor name
+      ExplicitParams
+      (Maybe GivenClause)
       [(SourceName, Group)] -- Field names and types
-  | CInterface [Group] -- Superclasses
-      NameAndArgs -- Class name and arguments
-      -- Method declarations: name, arguments, type.  TODO: Allow operators?
-      [(Group, Group)]
+      [(LetAnn, CDef)]
+  | CInterface
+      SourceName  -- Interface name
+      ExplicitParams
+      [(SourceName, Group)]  -- Method declarations
   | CEffectDecl SourceName [(SourceName, UResumePolicy, Group)]
   | CHandlerDecl SourceName -- Handler name
       SourceName -- Effect name
@@ -82,25 +92,37 @@ data CTopDecl'
       Group -- Handler arguments
       Group -- Handler type annotation
       [(SourceName, Maybe UResumePolicy, CSBlock)] -- Handler methods
+  -- header, givens (may be empty), methods, optional name.  The header should contain
+  -- the prerequisites, class name, and class arguments.
+  | CInstanceDecl CInstanceDef
   deriving (Show, Generic)
-
-type NameAndArgs = (SourceName, [Group])
-type NameAndType = (SourceName, Group)
 
 type CSDecl = WithSrc CSDecl'
 data CSDecl'
   = CLet Group CSBlock
-  -- Arrow binder <-
-  | CBind Group CSBlock
-  -- name, args, type, body.  The header should contain the parameters,
-  -- optional effects, and return type
-  | CDef SourceName Group (Maybe Group) CSBlock
-  -- header, givens (may be empty), methods, optional name.  The header should contain
-  -- the prerequisites, class name, and class arguments.
-  | CInstance Group Group
-      [(SourceName, CSBlock)] -- Method definitions
-      (Maybe SourceName) -- Optional name of instance
+  | CDefDecl CDef
   | CExpr Group
+  | CBind Group CSBlock -- Arrow binder <-
+  | CPass
+    deriving (Show, Generic)
+
+type CEffs = ([Group], Maybe Group)
+data CDef = CDef
+  SourceName
+  (ExplicitParams)
+  (Maybe CDefRhs)
+  (Maybe GivenClause)
+  CSBlock
+  deriving (Show, Generic)
+
+type CDefRhs = (AppExplicitness, Maybe CEffs, Group)
+
+data CInstanceDef = CInstanceDef
+  SourceName         -- interface name
+  [Group]            -- args at which we're instantiating the interface
+  (Maybe GivenClause)
+  [CSDecl]           -- Method definitions
+  (Maybe (SourceName, Maybe [Group])) -- Optional name of instance, with explicit parameters
   deriving (Show, Generic)
 
 type Group = WithSrc Group'
@@ -114,46 +136,37 @@ data Group'
   | CChar Char
   | CFloat Double
   | CHole
-  | CLabel LabelPrefix String
-  | CParens CSBlock
-  | CBracket Bracket Group
-  -- Encode various separators of lists (like commas) as infix
-  -- operators in their own right (with defined precedence!) at this
-  -- level.  We will enforce correct structure in the translation to
-  -- abstract syntax.
+  | CParens   [Group]
+  | CBrackets [Group]
   | CBin Bin Group Group
   | CPrefix SourceName Group -- covers unary - and unary + among others
   | CPostfix SourceName Group
-  | CLambda [Group] CSBlock  -- The arguments do not have Juxtapose at the top level
+  | CLambda [Group] CSBlock
   | CFor ForKind [Group] CSBlock -- also for_, rof, rof_
   | CCase Group [(Group, CSBlock)] -- scrutinee, alternatives
   | CIf Group CSBlock (Maybe CSBlock)
   | CDo CSBlock
-  deriving (Show, Generic)
+  | CGivens GivenClause
+  | CArrow Group (Maybe CEffs) Group
+  | CWith Group WithClause
+    deriving (Show, Generic)
 
 type Bin = WithSrc Bin'
 data Bin'
-  = Juxtapose
+  = JuxtaposeWithSpace
+  | JuxtaposeNoSpace
   | EvalBinOp String
-  | Ampersand
   | DepAmpersand
-  | IndexingDot
-  | FieldAccessDot
-  | Comma
+  | Dot
   | DepComma
   | Colon
   | DoubleColon
   | Dollar
-  | Arrow Arrow
-  | FatArrow  -- =>
-  | Question
+  | ImplicitArrow -- ->>
+  | FatArrow      -- =>
   | Pipe
   | CSEqual
   deriving (Eq, Ord, Show, Generic)
-
--- We can add others, like @{ or [| or whatever
-data Bracket = Square | Curly
-  deriving (Show, Generic)
 
 data LabelPrefix = PlainLabel
   deriving (Show, Generic)
@@ -166,8 +179,10 @@ data ForKind
   deriving (Show, Generic)
 
 -- `CSBlock` instead of `CBlock` because the latter is an alias for `Block CoreIR`.
-data CSBlock = CSBlock [CSDecl] -- last decl should be a CExpr
-  deriving (Show, Generic)
+data CSBlock =
+   IndentedBlock [CSDecl] -- last decl should be a CExpr
+ | ExprBlock Group
+   deriving (Show, Generic)
 
 -- === Untyped IR ===
 -- The AST of Dex surface language.
@@ -177,7 +192,6 @@ data UEffect (n::S) =
  | UExceptionEffect
  | UIOEffect
  | UUserEffect (SourceOrInternalName EffectNameC n)
- | UInitEffect
 
 data UEffectRow (n::S) =
   UEffectRow (S.Set (UEffect n)) (Maybe (SourceOrInternalName (AtomNameC CoreIR) n))
@@ -195,134 +209,142 @@ data UVar (n::S) =
  | UEffectVar   (Name EffectNameC   n)
  | UMethodVar   (Name MethodNameC   n)
  | UEffectOpVar (Name EffectOpNameC n)
- | UHandlerVar  (Name HandlerNameC  n)
+ | UPunVar      (Name TyConNameC n) -- for names also used as data constructors
    deriving (Eq, Ord, Show, Generic)
 
+type UAtomBinder = UBinder (AtomNameC CoreIR)
 data UBinder (c::C) (n::S) (l::S) where
   -- Only appears before renaming pass
   UBindSource :: SourceName -> UBinder c n n
   -- May appear before or after renaming pass
   UIgnore :: UBinder c n n
   -- The following binders only appear after the renaming pass.
-  -- We maintain the source name for user-facing error messages.
+  -- We maintain the source name for user-facing error messages
+  -- and named arguments.
   UBind :: SourceName -> NameBinder c n l -> UBinder c n l
+
+type UBlock = WithSrcE UBlock'
+data UBlock' (n::S) where
+  UBlock :: Nest UDecl n l -> UExpr l -> UBlock' n
+
+type UDecl = WithSrcB UDecl'
+data UDecl' (n::S) (l::S) where
+  ULet      :: LetAnn -> UPat n l -> Maybe (UType n) -> UExpr n -> UDecl' n l
+  UExprDecl :: UExpr n -> UDecl' n n
+  UPass     :: UDecl' n n
 
 type UExpr = WithSrcE UExpr'
 data UExpr' (n::S) =
    UVar (SourceNameOr UVar n)
+ | ULit LitVal
  | ULam (ULamExpr n)
  | UPi  (UPiExpr n)
- | UApp (UExpr n) (UExpr n)
+ | UApp (UExpr n) [UExpr n] [UNamedArg n]
  | UTabPi  (UTabPiExpr n)
  | UDepPairTy (UDepPairType n)
  | UDepPair (UExpr n) (UExpr n)
- | UTabApp (UExpr n) (UExpr n)
- | UDecl (UDeclExpr n)
+ | UTabApp (UExpr n) [UExpr n]
  | UFor Direction (UForExpr n)
  | UCase (UExpr n) [UAlt n]
+ | UDo (UBlock n)
  | UHole
  | UTypeAnn (UExpr n) (UExpr n)
  | UTabCon [UExpr n]
  | UPrim PrimName [UExpr n]
- | ULabel String
  | UFieldAccess (UExpr n) FieldName
- | URecord (UFieldRowElems n)                        -- {@v=x, a=y, b=z, ...rest}
- | ULabeledRow (UFieldRowElems n)                    -- {@v:X ? a:Y ? b:Z ? ...rest}
- | URecordTy (UFieldRowElems n)                      -- {@v:X & a:Y & b:Z & ...rest}
  | UNatLit   Word64
  | UIntLit   Int
  | UFloatLit Double
    deriving (Show, Generic)
 
-type UFieldRowElems (n::S) = [UFieldRowElem n]
-data UFieldRowElem (n::S)
-  = UStaticField String                (UExpr n)
-  | UDynField    (SourceNameOr UVar n) (UExpr n)
-  | UDynFields   (UExpr n)
-  deriving (Show)
-
-type FieldName = WithSrc String
+type UNamedArg (n::S) = (SourceName, UExpr n)
+type FieldName = WithSrc FieldName'
+data FieldName' =
+   FieldName SourceName
+ | FieldNum  Int
+  deriving (Show, Eq, Ord)
 
 data ULamExpr (n::S) where
-  ULamExpr :: Arrow -> UPatAnn n l -> UExpr l -> ULamExpr n
+  ULamExpr
+    :: Nest (WithExpl UOptAnnBinder) n l  -- args
+    -> AppExplicitness
+    -> Maybe (UEffectRow l)               -- optional effect
+    -> Maybe (UType l)                    -- optional result type
+    -> UBlock l                           -- body
+    -> ULamExpr n
 
 data UPiExpr (n::S) where
-  UPiExpr :: Arrow -> UPatAnn n l -> UEffectRow l -> UType l -> UPiExpr n
+  UPiExpr :: Nest (WithExpl UOptAnnBinder) n l -> AppExplicitness -> UEffectRow l -> UType l -> UPiExpr n
 
 data UTabPiExpr (n::S) where
-  UTabPiExpr :: UPatAnn n l -> UType l -> UTabPiExpr n
+  UTabPiExpr :: UOptAnnBinder n l -> UType l -> UTabPiExpr n
 
 data UDepPairType (n::S) where
-  UDepPairType :: UPatAnn n l -> UType l -> UDepPairType n
+  UDepPairType :: DepPairExplicitness -> UOptAnnBinder n l -> UType l -> UDepPairType n
 
-data UDeclExpr (n::S) where
-  UDeclExpr :: UDecl n l -> UExpr l -> UDeclExpr n
-
-type UConDef (n::S) (l::S) = (SourceName, Nest (UAnnBinder (AtomNameC CoreIR)) n l)
+type UConDef (n::S) (l::S) = (SourceName, Nest UReqAnnBinder n l)
 
 data UDataDef (n::S) where
   UDataDef
     :: SourceName  -- source name for pretty printing
-    -> Nest (UAnnBinderArrow (AtomNameC CoreIR)) n l
+    -> Nest (WithExpl UOptAnnBinder) n l
     -> [(SourceName, UDataDefTrail l)] -- data constructor types
     -> UDataDef n
 
 data UStructDef (n::S) where
   UStructDef
-    :: SourceName   -- source name for pretty printing
-    -> Nest (UAnnBinderArrow (AtomNameC CoreIR)) n l
-    -> [(SourceName, UType l)]  -- named payloads
+    :: SourceName    -- source name for pretty printing
+    -> Nest (WithExpl UOptAnnBinder) n l
+    -> [(SourceName, UType l)]                    -- named payloads
+    -> [(LetAnn, SourceName, Abs UAtomBinder ULamExpr l)] -- named methods (initial binder is for `self`)
     -> UStructDef n
 
 data UDataDefTrail (l::S) where
-  UDataDefTrail :: Nest (UAnnBinder (AtomNameC CoreIR)) l l' -> UDataDefTrail l
+  UDataDefTrail :: Nest UReqAnnBinder l l' -> UDataDefTrail l
 
-data UDecl (n::S) (l::S) where
-  ULet :: LetAnn -> UPatAnn n l -> UExpr n -> UDecl n l
+data UTopDecl (n::S) (l::S) where
+  ULocalDecl :: UDecl n l -> UTopDecl n l
   UDataDefDecl
     :: UDataDef n                          -- actual definition
     -> UBinder TyConNameC n l'             -- type constructor name
     ->   Nest (UBinder DataConNameC) l' l  -- data constructor names
-    -> UDecl n l
+    -> UTopDecl n l
   UStructDecl
-    :: UStructDef n                        -- actual definition
-    -> UBinder TyConNameC n l              -- type constructor name
-    -> UDecl n l
+    :: UBinder TyConNameC n l              -- type constructor name
+    -> UStructDef l                        -- actual definition
+    -> UTopDecl n l
   UInterface
-    :: Nest (UAnnBinder (AtomNameC CoreIR)) n p     -- parameter binders
-    ->  [UType p]                          -- superclasses
-    ->  [UMethodType p]                    -- method types
+    :: Nest (WithExpl UOptAnnBinder) n p   -- parameter binders
+    ->   [UType p]                         -- method types
     -> UBinder ClassNameC n l'             -- class name
     ->   Nest (UBinder MethodNameC) l' l   -- method names
-    -> UDecl n l
+    -> UTopDecl n l
   UInstance
     :: SourceNameOr (Name ClassNameC) n  -- class name
-    -> Nest UPatAnnArrow n l'            -- type args and dictionary args
+    -> Nest (WithExpl UOptAnnBinder) n l'
     ->   [UExpr l']                      -- class parameters
     ->   [UMethodDef l']                 -- method definitions
     -- Maybe we should make a separate color (namespace) for instance names?
-    -> MaybeB (UBinder (AtomNameC CoreIR)) n l    -- optional instance name
-    -> UDecl n l
+    -> MaybeB UAtomBinder n l    -- optional instance name
+    -> AppExplicitness           -- explicitness (only relevant for named instances)
+    -> UTopDecl n l
   UEffectDecl
     :: [UEffectOpType n]                  -- operation types
     -> UBinder EffectNameC n l'           -- effect name
     -> Nest (UBinder EffectOpNameC) l' l  -- operation names
-    -> UDecl n l
+    -> UTopDecl n l
   UHandlerDecl
     :: SourceNameOr (Name EffectNameC) n  -- effect name
-    -> UBinder (AtomNameC CoreIR) n b              -- body type argument
-    -> Nest UPatAnnArrow b l'             -- type args
+    -> UAtomBinder n b                    -- body type argument
+    -> Nest (WithExpl UOptAnnBinder) b l' -- type args
     ->   UEffectRow l'                    -- returning effect
     ->   UType l'                         -- returning type
     ->   [UEffectOpDef l']                -- operation definitions
     -> UBinder HandlerNameC n l           -- handler name
-    -> UDecl n l
+    -> UTopDecl n l
 
 type UType = UExpr
-
-data UMethodType (n::S) where
-  UMethodType :: Either [SourceName] [Bool] -> UType s -> UMethodType s
-  deriving (Show, Generic)
+type UConstraint = UExpr
 
 data UEffectOpType (n::S) where
   UEffectOpType :: UResumePolicy -> UType s -> UEffectOpType s
@@ -338,9 +360,10 @@ instance Hashable UResumePolicy
 instance Store UResumePolicy
 
 data UForExpr (n::S) where
-  UForExpr :: UPatAnn n l -> UExpr l -> UForExpr n
+  UForExpr :: UOptAnnBinder n l -> UBlock l -> UForExpr n
 
-data UMethodDef (n::S) = UMethodDef (SourceNameOr (Name MethodNameC) n) (UExpr n)
+type UMethodDef = WithSrcE UMethodDef'
+data UMethodDef' (n::S) = UMethodDef (SourceNameOr (Name MethodNameC) n) (ULamExpr n)
   deriving (Show, Generic)
 
 data UEffectOpDef (n::S) =
@@ -348,52 +371,49 @@ data UEffectOpDef (n::S) =
   | UReturnOpDef (UExpr n)
   deriving (Show, Generic)
 
-data UPatAnn (n::S) (l::S) = UPatAnn (UPat n l) (Maybe (UType n))
+data AnnRequirement = AnnRequired | AnnOptional
+
+data UAnn (annReq::AnnRequirement) (n::S) where
+  UAnn   :: UType n -> UAnn annReq      n
+  UNoAnn ::            UAnn AnnOptional n
+deriving instance Show (UAnn annReq n)
+
+
+data UAnnBinder (annReq::AnnRequirement) (n::S) (l::S) =
+  UAnnBinder (UAtomBinder n l) (UAnn annReq n) [UConstraint n]
   deriving (Show, Generic)
 
-data UPatAnnArrow (n::S) (l::S) = UPatAnnArrow (UPatAnn n l) Arrow
-  deriving (Show, Generic)
-
-data UAnnBinder (c::C) (n::S) (l::S) = UAnnBinder (UBinder c n l) (UType n)
-  deriving (Show, Generic)
-
-data UAnnBinderArrow (c::C) (n::S) (l::S) =
-  UAnnBinderArrow (UBinder c n l) (UType n) Arrow
-  deriving (Show, Generic)
-
-plainUAnnBinder :: UAnnBinder c n l -> UAnnBinderArrow c n l
-plainUAnnBinder (UAnnBinder b ty) = UAnnBinderArrow b ty PlainArrow
-
-classUAnnBinder :: UAnnBinder c n l -> UAnnBinderArrow c n l
-classUAnnBinder (UAnnBinder b ty) = UAnnBinderArrow b ty ClassArrow
+type UReqAnnBinder = UAnnBinder AnnRequired :: B
+type UOptAnnBinder = UAnnBinder AnnOptional :: B
 
 data UAlt (n::S) where
-  UAlt :: UPat n l -> UExpr l -> UAlt n
-
-data UFieldRowPat (n::S) (l::S) where
-  UEmptyRowPat    :: UFieldRowPat n n
-  URemFieldsPat   :: UBinder (AtomNameC CoreIR) n l -> UFieldRowPat n l
-  UStaticFieldPat :: Label               -> UPat n l' -> UFieldRowPat l' l -> UFieldRowPat n l
-  UDynFieldsPat   :: SourceNameOr UVar n -> UPat n l' -> UFieldRowPat l' l -> UFieldRowPat n l
-  UDynFieldPat    :: SourceNameOr UVar n -> UPat n l' -> UFieldRowPat l' l -> UFieldRowPat n l
-
-instance Show (UFieldRowPat n l) where
-  show _ = "UFieldRowPat <TODO>"
+  UAlt :: UPat n l -> UBlock l -> UAlt n
 
 type UPat = WithSrcB UPat'
 data UPat' (n::S) (l::S) =
-   UPatBinder (UBinder (AtomNameC CoreIR) n l)
+   UPatBinder (UAtomBinder n l)
  | UPatCon (SourceNameOr (Name DataConNameC) n) (Nest UPat n l)
- | UPatPair (PairB UPat UPat n l)
+ | UPatProd (Nest UPat n l)
  | UPatDepPair (PairB UPat UPat n l)
- | UPatUnit (UnitB n l)
- -- The name+ExtLabeledItems and the PairBs are parallel, constrained by the parser.
- | UPatRecord (UFieldRowPat n l)
  | UPatTable (Nest UPat n l)
   deriving (Show)
 
 pattern UPatIgnore :: UPat' (n::S) n
 pattern UPatIgnore = UPatBinder UIgnore
+
+-- === source names for error messages ===
+
+class HasSourceName a where
+  getSourceName :: a -> SourceName
+
+instance HasSourceName (UAnnBinder req n l) where
+  getSourceName (UAnnBinder b _ _) = getSourceName b
+
+instance HasSourceName (UBinder c n l) where
+  getSourceName = \case
+    UBindSource sn -> sn
+    UIgnore        -> "_"
+    UBind sn _     -> sn
 
 -- === Source context helpers ===
 
@@ -447,8 +467,6 @@ data UModule = UModule
 
 -- === top-level blocks ===
 
-type SourceName = String
-
 data SourceBlock = SourceBlock
   { sbLine     :: Int
   , sbOffset   :: Int
@@ -464,7 +482,7 @@ data SymbolicZeros = SymbolicZeros | InstantiateZeros
 
 data SourceBlock'
   = TopDecl CTopDecl
-  | Command CmdName CSBlock
+  | Command CmdName Group
   | DeclareForeign SourceName SourceName Group
   | DeclareCustomLinearization SourceName SymbolicZeros Group
   | Misc SourceBlockMisc
@@ -525,18 +543,22 @@ data EnvQuery =
 -- === Primitive names ===
 
 data PrimName =
-    UPrimTC  (PrimTC CoreIR ())
-  | UPrimCon (PrimCon CoreIR ())
-  | UPrimOp  (PrimOp ())
-  | URecordOp (RecordOp ())
-  | UMAsk | UMExtend | UMGet | UMPut
-  | UWhile | ULinearize | UTranspose
-  | URunReader | URunWriter | URunState | URunIO | UCatchException
-  | UProjNewtype | UExplicitApply | UMonoLiteral
-  | UIndexRef | UProjRef Int | UProjMethod Int
-  | UNat | UNatCon | UFin | ULabelType
-  | UEffectRowKind | ULabeledRowKind
-    deriving (Show, Eq)
+   UBaseType BaseType
+ | UPrimTC   P.TC
+ | UCon      P.Con
+ | UMemOp    P.MemOp
+ | UVectorOp P.VectorOp
+ | UMiscOp   P.MiscOp
+ | UUnOp     UnOp
+ | UBinOp    BinOp
+ | UMAsk | UMExtend | UMGet | UMPut
+ | UWhile | ULinearize | UTranspose
+ | URunReader | URunWriter | URunState | URunIO | UCatchException
+ | UProjNewtype | UExplicitApply | UMonoLiteral
+ | UIndexRef | UApplyMethod Int
+ | UNat | UNatCon | UFin | UEffectRowKind
+ | UTuple -- overloaded for type constructor and data constructor, resolved in inference
+   deriving (Show, Eq)
 
 -- === instances ===
 
@@ -595,7 +617,7 @@ instance GenericE UVar where
   type RepE UVar = EitherE8 (Name (AtomNameC CoreIR)) (Name TyConNameC)
                             (Name DataConNameC)  (Name ClassNameC)
                             (Name MethodNameC)   (Name EffectNameC)
-                            (Name EffectOpNameC) (Name HandlerNameC)
+                            (Name EffectOpNameC) (Name TyConNameC)
   fromE name = case name of
     UAtomVar     v -> Case0 v
     UTyConVar    v -> Case1 v
@@ -604,7 +626,7 @@ instance GenericE UVar where
     UMethodVar   v -> Case4 v
     UEffectVar   v -> Case5 v
     UEffectOpVar v -> Case6 v
-    UHandlerVar  v -> Case7 v
+    UPunVar      v -> Case7 v
   {-# INLINE fromE #-}
 
   toE name = case name of
@@ -615,7 +637,7 @@ instance GenericE UVar where
     Case4 v -> UMethodVar   v
     Case5 v -> UEffectVar   v
     Case6 v -> UEffectOpVar v
-    Case7 v -> UHandlerVar  v
+    Case7 v -> UPunVar v
   {-# INLINE toE #-}
 
 instance Pretty (UVar n) where
@@ -627,7 +649,7 @@ instance Pretty (UVar n) where
     UMethodVar   v -> "Method name: " <> pretty v
     UEffectVar   v -> "Effect name: " <> pretty v
     UEffectOpVar v -> "Effect operation name: " <> pretty v
-    UHandlerVar  v -> "Handler name: " <> pretty v
+    UPunVar      v -> "Shared type constructor / data constructor name: " <> pretty v
 
 -- TODO: name subst instances for the rest of UExpr
 instance SinkableE      UVar
@@ -666,18 +688,12 @@ instance Color c => BindsAtMostOneName (UBinder c) c where
     UIgnore       -> emptyInFrag
     UBind _ b'    -> b' @> x
 
-uBinderSourceName :: UBinder c n l -> SourceName
-uBinderSourceName b = case b of
-  UBindSource v -> v
-  UIgnore       -> "_"
-  UBind v _     -> v
+instance ProvesExt  (UAnnBinder  req) where
+instance BindsNames  (UAnnBinder req) where
+  toScopeFrag (UAnnBinder b _ _) = toScopeFrag b
 
-instance Color c => ProvesExt (UAnnBinder c) where
-instance Color c => BindsNames (UAnnBinder c) where
-  toScopeFrag (UAnnBinder b _) = toScopeFrag b
-
-instance Color c => BindsAtMostOneName (UAnnBinder c) c where
-  UAnnBinder b _ @> x = b @> x
+instance BindsAtMostOneName (UAnnBinder req) (AtomNameC CoreIR) where
+  UAnnBinder b _ _ @> x = b @> x
 
 instance GenericE (WithSrcE e) where
   type RepE (WithSrcE e) = PairE (LiftE SrcPosCtx) e
@@ -689,7 +705,13 @@ instance SinkableE e => SinkableE (WithSrcE e)
 instance SinkableE UExpr' where
   sinkingProofE _ = todoSinkableProof
 
+instance SinkableE UBlock' where
+  sinkingProofE _ = todoSinkableProof
+
 instance SinkableB UDecl where
+  sinkingProofB _ _ _ = todoSinkableProof
+
+instance SinkableB UTopDecl where
   sinkingProofB _ _ _ = todoSinkableProof
 
 instance Eq SourceBlock where
@@ -720,8 +742,8 @@ instance IsString (UBinder s VoidS VoidS) where
 instance IsString (UPat' VoidS VoidS) where
   fromString = UPatBinder . fromString
 
-instance IsString (UPatAnn VoidS VoidS) where
-  fromString s = UPatAnn (fromString s) Nothing
+instance IsString (UOptAnnBinder VoidS VoidS) where
+  fromString s = UAnnBinder (fromString s) UNoAnn []
 
 instance IsString (UExpr' VoidS) where
   fromString = UVar . fromString
@@ -738,10 +760,10 @@ deriving instance Show (ULamExpr n)
 deriving instance Show (UPiExpr n)
 deriving instance Show (UTabPiExpr n)
 deriving instance Show (UDepPairType n)
-deriving instance Show (UDeclExpr n)
 deriving instance Show (UDataDef n)
 deriving instance Show (UStructDef n)
-deriving instance Show (UDecl n l)
+deriving instance Show (UDecl' n l)
+deriving instance Show (UBlock' n)
 deriving instance Show (UForExpr n)
 deriving instance Show (UAlt n)
 

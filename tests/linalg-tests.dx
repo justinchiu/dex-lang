@@ -1,5 +1,11 @@
 import linalg
 
+-- Check that the optimized matmul gives the same answers as the naive one
+amat = for i:(Fin 100) j:(Fin 100). n_to_f $ ordinal (i, j)
+
+:p tiled_matmul(amat, amat) ~~ naive_matmul amat amat
+> True
+
 -- Check that the inverse of the inverse is identity.
 mat = [[11.,9.,24.,2.],[1.,5.,2.,6.],[3.,17.,18.,1.],[2.,5.,7.,1.]]
 :p mat ~~ (invert (invert mat))
@@ -30,12 +36,12 @@ v = [1., 2., 3., 4.]
 
 -- Check that we can linearize LU decomposition
 -- This is a regression test for Issue #842.
-snd (linearize (\x. snd $ sign_and_log_determinant [[x]]) 1.0) 2.0
+snd(linearize (\x. snd $ sign_and_log_determinant [[x]]) 1.0)(2.0)
 > 2.
 
 -- Check that we can differentiate through LU decomposition
 -- This is a regression test for Issue #848.
-grad (\x. snd $ pivotize [[x]]) 1.0
+grad (\x. (pivotize [[x]]).sign) 1.0
 > 0.
 
 grad (\x. snd $ sign_and_log_determinant [[x]]) 2.0
@@ -43,10 +49,10 @@ grad (\x. snd $ sign_and_log_determinant [[x]]) 2.0
 
 -- Check forward_substitute solve by comparing
 -- against zero-padding and doing the full solve.
-def padLowerTriMat {n v} [Add v] (mat:LowerTriMat n v) : n=>n=>v =
+def padLowerTriMat(mat:LowerTriMat n v) -> n=>n=>v given (n|Ix, v|Add) =
   for i j.
     if (ordinal j)<=(ordinal i)
-      then mat.i.(unsafe_project _ j)
+      then mat[i,unsafe_project j]
       else zero
 
 lower : LowerTriMat (Fin 4) Float = arb $ new_key 0

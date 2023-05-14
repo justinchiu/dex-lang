@@ -1,6 +1,12 @@
+-- Copyright 2022 Google LLC
+--
+-- Use of this source code is governed by a BSD-style
+-- license that can be found in the LICENSE file or at
+-- https://developers.google.com/open-source/licenses/bsd
+
 module Lexing where
 
-import Control.Monad.Reader
+import Control.Monad.State.Strict
 import Data.Char
 import Data.HashSet qualified as HS
 import qualified Data.Scientific as Scientific
@@ -17,15 +23,21 @@ import qualified Text.Megaparsec.Char.Lexer as L
 import Text.Megaparsec.Debug
 
 import Err
-import LabeledItems
-import Types.Source
+import Types.Primitives
 
-data ParseCtx = ParseCtx { curIndent :: Int
-                         , canBreak  :: Bool }
-type Parser = ReaderT ParseCtx (Parsec Void Text)
+data ParseCtx = ParseCtx
+  { curIndent      :: Int  -- used Reader-style (i.e. ask/local)
+  , canBreak       :: Bool -- used Reader-style (i.e. ask/local)
+  , prevWhitespace :: Bool -- tracks whether we just consumed whitespace
+  }
+
+initParseCtx :: ParseCtx
+initParseCtx = ParseCtx 0 False False
+
+type Parser = StateT ParseCtx (Parsec Void Text)
 
 parseit :: Text -> Parser a -> Except a
-parseit s p = case parse (runReaderT p (ParseCtx 0 False)) "" s of
+parseit s p = case parse (fst <$> runStateT p initParseCtx) "" s of
   Left e  -> throw ParseErr $ errorBundlePretty e
   Right x -> return x
 
@@ -36,8 +48,8 @@ mustParseit s p  = case parseit s p of
 
 debug :: (Show a) => String -> Parser a -> Parser a
 debug lbl action = do
-  ctx <- ask
-  lift $ dbg lbl $ runReaderT action ctx
+  ctx <- get
+  lift $ dbg lbl $ fst <$> runStateT action ctx
 
 -- === Lexemes ===
 
@@ -49,10 +61,6 @@ nextChar = do
   guard $ not $ T.null i
   return $ T.head i
 {-# INLINE nextChar #-}
-
-lowerName  :: Lexer SourceName
-lowerName = label "lower-case name" $ lexeme $
-  checkNotKeyword $ (:) <$> lowerChar <*> many nameTailChar
 
 anyCaseName  :: Lexer SourceName
 anyCaseName = label "name" $ lexeme $
@@ -71,7 +79,7 @@ checkNotKeyword p = try $ do
 
 data KeyWord = DefKW | ForKW | For_KW | RofKW | Rof_KW | CaseKW | OfKW
              | DataKW | StructKW | InterfaceKW
-             | InstanceKW | GivenKW
+             | InstanceKW | GivenKW | WithKW | SatisfyingKW
              | IfKW | ThenKW | ElseKW | DoKW
              | ImportKW | ForeignKW | NamedInstanceKW
              | EffectKW | HandlerKW | JmpKW | CtlKW | ReturnKW | ResumeKW
@@ -96,6 +104,8 @@ keyWordToken = \case
   InstanceKW      -> "instance"
   NamedInstanceKW -> "named-instance"
   GivenKW         -> "given"
+  WithKW          -> "with"
+  SatisfyingKW    -> "satisfying"
   DoKW            -> "do"
   ImportKW        -> "import"
   ForeignKW       -> "foreign"
@@ -118,10 +128,6 @@ keyWordSet = HS.fromList keyWordStrs
 
 keyWordStrs :: [String]
 keyWordStrs = map keyWordToken [DefKW .. PassKW]
-
-fieldLabel :: Lexer Label
-fieldLabel = label "field label" $ lexeme $
-  checkNotKeyword $ (:) <$> (lowerChar <|> upperChar) <*> many nameTailChar
 
 primName :: Lexer String
 primName = lexeme $ try $ char '%' >> some alphaNumChar
@@ -148,17 +154,13 @@ doubleLit = lexeme $
 knownSymStrs :: HS.HashSet String
 knownSymStrs = HS.fromList
   [ ".", ":", "::", "!", "=", "-", "+", "||", "&&"
-  , "$", "&", "&>", "|", ",", ",>", "<-", "+=", ":="
-  , "->", "=>", "?->", "?=>", "--o", "--", "<<<", ">>>", "<<&", "&>>"
+  , "$", "&>", "|", ",", ",>", "<-", "+=", ":="
+  , "->", "->>", "=>", "?->", "?=>", "--o", "--", "<<<", ">>>"
   , "..", "<..", "..<", "..<", "<..<", "?", "#", "##", "#?", "#&", "#|", "@"]
 
 -- string must be in `knownSymStrs`
 sym :: Text -> Lexer ()
-sym s = lexeme $ try $ string s >> notFollowedBy continuation
-  -- This awful hack is because "|}" should be a single lexeme for
-  -- variants, but we can't make "}" be a symChar because that would
-  -- allow user-defined symbols like --}, which is horrible.
-  where continuation = if s == "|" then (symChar <|> char '}') else symChar
+sym s = lexeme $ try $ string s >> notFollowedBy symChar
 
 anySym :: Lexer String
 anySym = lexeme $ try $ do
@@ -203,7 +205,8 @@ symChars = HS.fromList ".,!$^&*:-~+/=<>|?\\@#"
 -- === Util ===
 
 sc :: Parser ()
-sc = skipMany $ hidden space <|> hidden lineComment
+sc = (skipSome s >> recordWhitespace) <|> return ()
+  where s = hidden space <|> hidden lineComment
 
 lineComment :: Parser ()
 lineComment = do
@@ -214,23 +217,29 @@ outputLines :: Parser ()
 outputLines = void $ many (symbol ">" >> takeWhileP Nothing (/= '\n') >> ((eol >> return ()) <|> eof))
 
 space :: Parser ()
-space = do
-  consumeNewLines <- asks canBreak
-  if consumeNewLines
-    then space1
-    else void $ takeWhile1P (Just "white space") (`elem` (" \t" :: String))
+space = gets canBreak >>= \case
+  True  -> space1
+  False -> void $ takeWhile1P (Just "white space") (`elem` (" \t" :: String))
 
 mayBreak :: Parser a -> Parser a
-mayBreak p = local (\ctx -> ctx { canBreak = True }) p
+mayBreak p = pLocal (\ctx -> ctx { canBreak = True }) p
 {-# INLINE mayBreak #-}
 
 mayNotBreak :: Parser a -> Parser a
-mayNotBreak p = local (\ctx -> ctx { canBreak = False }) p
+mayNotBreak p = pLocal (\ctx -> ctx { canBreak = False }) p
 {-# INLINE mayNotBreak #-}
 
-optionalMonoid :: Monoid a => Parser a -> Parser a
-optionalMonoid p = p <|> return mempty
-{-# INLINE optionalMonoid #-}
+precededByWhitespace :: Parser Bool
+precededByWhitespace = gets prevWhitespace
+{-# INLINE precededByWhitespace #-}
+
+recordWhitespace :: Parser ()
+recordWhitespace = modify \ctx -> ctx { prevWhitespace = True }
+{-# INLINE recordWhitespace #-}
+
+recordNonWhitespace :: Parser ()
+recordNonWhitespace = modify \ctx -> ctx { prevWhitespace = False }
+{-# INLINE recordNonWhitespace #-}
 
 nameString :: Parser String
 nameString = lexeme . try $ (:) <$> lowerChar <*> many alphaNumChar
@@ -265,7 +274,7 @@ withPos p = do
 nextLine :: Parser ()
 nextLine = do
   eol
-  n <- asks curIndent
+  n <- curIndent <$> get
   void $ mayNotBreak $ many $ try (sc >> eol)
   void $ replicateM n (char ' ')
 
@@ -281,8 +290,14 @@ withIndent p = do
   nextLine
   indent <- T.length <$> takeWhileP (Just "space") (==' ')
   when (indent <= 0) empty
-  local (\ctx -> ctx { curIndent = curIndent ctx + indent }) $ p
+  pLocal (\ctx -> ctx { curIndent = curIndent ctx + indent }) $ mayNotBreak p
 {-# INLINE withIndent #-}
+
+pLocal :: (ParseCtx -> ParseCtx) -> Parser a -> Parser a
+pLocal f p = do
+  s <- get
+  put (f s) >> p <* put s
+{-# INLINE pLocal #-}
 
 eol :: Parser ()
 eol = void MC.eol
@@ -295,7 +310,7 @@ failIf True s = fail s
 failIf False _ = return ()
 
 lexeme :: Parser a -> Parser a
-lexeme = L.lexeme sc
+lexeme p = L.lexeme sc (p <* recordNonWhitespace)
 {-# INLINE lexeme #-}
 
 symbol :: Text -> Parser ()

@@ -221,8 +221,12 @@ instance BindsEnv EnvFrag where
   toEnvFrag frag = frag
   {-# INLINE toEnvFrag #-}
 
+instance BindsEnv b => BindsEnv (WithExpl b) where
+  toEnvFrag (WithExpl _ b) = toEnvFrag b
+  {-# INLINE toEnvFrag #-}
+
 instance BindsEnv RolePiBinder where
-  toEnvFrag (RolePiBinder b ty _ _) = toEnvFrag (b:>ty)
+  toEnvFrag (RolePiBinder _ b) = toEnvFrag b
   {-# INLINE toEnvFrag #-}
 
 instance BindsEnv (RecSubstFrag Binding) where
@@ -293,7 +297,7 @@ instance ExtOutMap Env UnitB where
 -- === Monadic helpers ===
 
 lookupEnv :: (Color c, EnvReader m) => Name c o -> m o (Binding c o)
-lookupEnv v = withEnv $ flip lookupEnvPure v
+lookupEnv v = withEnv $ flip lookupEnvPure v . topEnv
 {-# INLINE lookupEnv #-}
 
 lookupAtomName :: (IRRep r, EnvReader m) => AtomName r n -> m n (AtomBinding r n)
@@ -313,21 +317,38 @@ lookupModule :: EnvReader m => ModuleName n -> m n (Module n)
 lookupModule name = lookupEnv name >>= \case ModuleBinding m -> return m
 {-# INLINE lookupModule #-}
 
-lookupFunObjCode :: EnvReader m => FunObjCodeName n -> m n (FunObjCode, LinktimeNames n)
-lookupFunObjCode name = lookupEnv name >>= \case FunObjCodeBinding obj m -> return (obj, m)
+lookupSpecDict :: EnvReader m => SpecDictName n -> m n (SpecializedDictDef n)
+lookupSpecDict name = lookupEnv name >>=
+  \case SpecializedDictBinding m -> return m
+{-# INLINE lookupSpecDict #-}
+
+lookupFunObjCode :: EnvReader m => FunObjCodeName n -> m n (CFunction n)
+lookupFunObjCode name = lookupEnv name >>= \case FunObjCodeBinding cFun -> return cFun
 {-# INLINE lookupFunObjCode #-}
 
-lookupDataDef :: EnvReader m => DataDefName n -> m n (DataDef n)
-lookupDataDef name = lookupEnv name >>= \case DataDefBinding x _ -> return x
-{-# INLINE lookupDataDef #-}
+lookupTyCon :: EnvReader m => TyConName n -> m n (TyConDef n)
+lookupTyCon name = lookupEnv name >>= \case
+  TyConBinding (Just x) _ -> return x
+  TyConBinding Nothing  _ -> error "TyCon not yet defined"
+{-# INLINE lookupTyCon #-}
+
+lookupDataCon :: EnvReader m => Name DataConNameC n -> m n (TyConName n, Int)
+lookupDataCon v = do
+  ~(DataConBinding defName idx) <- lookupEnv v
+  return (defName, idx)
+{-# INLINE lookupDataCon #-}
 
 lookupClassDef :: EnvReader m => ClassName n -> m n (ClassDef n)
 lookupClassDef name = lookupEnv name >>= \case ClassBinding x -> return x
 {-# INLINE lookupClassDef #-}
 
 lookupInstanceDef :: EnvReader m => InstanceName n -> m n (InstanceDef n)
-lookupInstanceDef name = lookupEnv name >>= \case InstanceBinding x -> return x
+lookupInstanceDef name = lookupEnv name >>= \case InstanceBinding x _ -> return x
 {-# INLINE lookupInstanceDef #-}
+
+lookupInstanceTy :: EnvReader m => InstanceName n -> m n (CorePiType n)
+lookupInstanceTy name = lookupEnv name >>= \case InstanceBinding _ ty -> return ty
+{-# INLINE lookupInstanceTy #-}
 
 lookupEffectDef :: EnvReader m => EffectName n -> m n (EffectDef n)
 lookupEffectDef name = lookupEnv name >>= \case EffectBinding x -> return x
@@ -398,62 +419,43 @@ getInstanceDicts name = do
   return $ M.findWithDefault [] name $ instanceDicts $ envSynthCandidates env
 {-# INLINE getInstanceDicts #-}
 
-nonDepPiType :: ScopeReader m
-             => Arrow -> CType n -> EffectRow CoreIR n -> CType n -> m n (PiType n)
-nonDepPiType arr argTy eff resultTy =
-  toConstAbs (PairE eff resultTy) >>= \case
-    Abs b (PairE eff' resultTy') ->
-      return $ PiType (b:>argTy) arr eff' resultTy'
+nonDepPiType :: EnvReader m
+             => [CType n] -> EffectRow CoreIR n -> CType n -> m n (CorePiType n)
+nonDepPiType argTys eff resultTy = do
+  Abs bs (PairE eff' resultTy') <- typesAsBinderNest argTys (PairE eff resultTy)
+  let bs' = fmapNest (WithExpl Explicit) bs
+  return $ CorePiType ExplicitApp bs' eff' resultTy'
+
+typesAsBinderNest
+  :: forall m r n e. (EnvReader m, IRRep r, SinkableE e)
+  => [Type r n] -> e n -> m n (Abs (Nest (Binder r)) e n)
+typesAsBinderNest types body =
+  getDistinct >>= \Distinct -> liftEnvReaderM $ go types
+  where
+    go :: forall l.  DExt n l => [Type r l] -> EnvReaderM l (Abs (Nest (Binder r)) e l)
+    go = \case
+      [] -> Abs Empty <$> sinkM body
+      ty:rest -> withFreshBinder noHint ty \b -> do
+        Abs bs body' <- go $ map sink rest
+        return $ Abs (Nest b bs) body'
 
 nonDepTabPiType :: (IRRep r, ScopeReader m) => IxType r n -> Type r n -> m n (TabPiType r n)
 nonDepTabPiType argTy resultTy =
   toConstAbs resultTy >>= \case
     Abs b resultTy' -> return $ TabPiType (b:>argTy) resultTy'
 
-considerNonDepPiType :: PiType n -> Maybe (Arrow, CType n, EffectRow CoreIR n, CType n)
-considerNonDepPiType (PiType (b:>argTy) arr eff resultTy) = do
-  HoistSuccess (PairE eff' resultTy') <- return $ hoist b (PairE eff resultTy)
-  return (arr, argTy, eff', resultTy')
-
-fromNonDepPiType :: (IRRep r, ScopeReader m, MonadFail1 m)
-                 => Arrow -> Type r n -> m n (Type r n, EffectRow r n, Type r n)
-fromNonDepPiType arr ty = do
-  Pi (PiType (b:>argTy) arr' eff resultTy) <- return ty
-  unless (arr == arr') $ fail "arrow type mismatch"
-  HoistSuccess (PairE eff' resultTy') <- return $ hoist b (PairE eff resultTy)
-  return $ (argTy, eff', resultTy')
-
-fromNonDepTabType :: (IRRep r, ScopeReader m, MonadFail1 m) => Type r n -> m n (IxType r n, Type r n)
-fromNonDepTabType ty = do
-  TabPi (TabPiType (b :> ixTy) resultTy) <- return ty
-  HoistSuccess resultTy' <- return $ hoist b resultTy
-  return (ixTy, resultTy')
-
-nonDepDataConTys :: DataConDef n -> Maybe [CType n]
-nonDepDataConTys (DataConDef _ _ repTy idxs) =
-  case repTy of
-    ProdTy tys | length idxs == length tys -> Just tys
-    _ -> Nothing
-
-infixr 1 ?-->
-infixr 1 -->
-infixr 1 --@
-
-(?-->) :: ScopeReader m => CType n -> CType n -> m n (CType n)
-a ?--> b = Pi <$> nonDepPiType ImplicitArrow a Pure b
-
-(-->) :: ScopeReader m => CType n -> CType n -> m n (CType n)
-a --> b = Pi <$> nonDepPiType PlainArrow a Pure b
-
-(--@) :: ScopeReader m => CType n -> CType n -> m n (CType n)
-a --@ b = Pi <$> nonDepPiType LinArrow a Pure b
-
 (==>) :: (IRRep r, ScopeReader m) => IxType r n -> Type r n -> m n (Type r n)
 a ==> b = TabPi <$> nonDepTabPiType a b
 
+finTabTyCore :: EnvReader m => CAtom n -> CType n -> m n (CType n)
+finTabTyCore n eltTy = IxType (FinTy n) (IxDictAtom (DictCon (IxFin n))) ==> eltTy
+
+finIxTy :: Int -> IxType r n
+finIxTy n = IxType IdxRepTy (IxDictRawFin (IdxRepVal $ fromIntegral n))
+
 -- These `fromNary` functions traverse a chain of unary structures (LamExpr,
--- TabLamExpr, PiType, respectively) up to the given maxDepth, and return the
--- discovered binders packed as the nary structure (NaryLamExpr or NaryPiType),
+-- TabLamExpr, CorePiType, respectively) up to the given maxDepth, and return the
+-- discovered binders packed as the nary structure (NaryLamExpr or PiType),
 -- including a count of how many binders there were.
 -- - If there are no binders, return Nothing.
 -- - If there are more than maxDepth binders, only return maxDepth of them, and
@@ -475,42 +477,6 @@ liftLamExpr f (LamExpr bs body) = liftEnvReaderM $
 destBlockEffects :: IRRep r => DestBlock r n -> EffectRow r n
 destBlockEffects (DestBlock destb block) =
   ignoreHoistFailure $ hoist destb $ blockEffects block
-
-lamExprToAtom :: LamExpr CoreIR n -> Arrow -> Maybe (EffAbs n) -> Atom CoreIR n
-lamExprToAtom lam@(UnaryLamExpr b block) arr maybeEffAbs = Lam lam arr effAbs
-  where effAbs = case maybeEffAbs of
-          Just e -> e
-          Nothing -> Abs b $ blockEffects block
-lamExprToAtom _ _ _ = error "not a unary lambda expression"
-
-naryLamExprToAtom :: LamExpr CoreIR n -> [Arrow] -> CAtom n
-naryLamExprToAtom lam@(LamExpr (Nest b bs) body) (arr:arrs) = case bs of
-  Empty -> lamExprToAtom lam arr Nothing
-  _ -> do
-    let rest = naryLamExprToAtom (LamExpr bs body) arrs
-    Lam (UnaryLamExpr b (AtomicBlock rest)) arr (Abs b Pure)
-naryLamExprToAtom _ _ = error "unexpected nullary lambda expression"
-
--- first argument is the number of args expected
-fromNaryLamExact :: Int -> Atom r n -> Maybe (LamExpr r n)
-fromNaryLamExact exactDepth _ | exactDepth <= 0 = error "expected positive number of args"
-fromNaryLamExact exactDepth lam = do
-  (realDepth, naryLam) <- fromNaryLam exactDepth lam
-  guard $ realDepth == exactDepth
-  return naryLam
-
-fromNaryLam :: Int -> Atom r n -> Maybe (Int, LamExpr r n)
-fromNaryLam maxDepth | maxDepth <= 0 = error "expected positive number of args"
-fromNaryLam maxDepth = \case
-  Lam (LamExpr (Nest b Empty) body) _ (Abs _ effs) ->
-    extend <|> (Just (1, LamExpr (Nest b Empty) body))
-    where
-      extend = case (effs, body) of
-        (Pure, AtomicBlock lam) | maxDepth > 1 -> do
-          (d, LamExpr bs body2) <- fromNaryLam (maxDepth - 1) lam
-          return $ (d + 1, LamExpr (Nest b bs) body2)
-        _ -> Nothing
-  _ -> Nothing
 
 type NaryTabLamExpr = Abs (Nest SBinder) (Abs (Nest SDecl) CAtom)
 
@@ -536,9 +502,9 @@ fromNaryTabLamExact exactDepth lam = do
   return naryLam
 
 fromNaryForExpr :: IRRep r => Int -> Expr r n -> Maybe (Int, LamExpr r n)
-fromNaryForExpr maxDepth | maxDepth <= 0 = error "expected positive number of args"
+fromNaryForExpr maxDepth | maxDepth <= 0 = error "expected non-negative number of args"
 fromNaryForExpr maxDepth = \case
-  Hof (For _ _ (UnaryLamExpr b body)) ->
+  PrimOp (Hof (For _ _ (UnaryLamExpr b body))) ->
     extend <|> (Just $ (1, LamExpr (Nest b Empty) body))
     where
       extend = do
@@ -547,17 +513,6 @@ fromNaryForExpr maxDepth = \case
         (d, LamExpr bs body2) <- fromNaryForExpr (maxDepth - 1) expr
         return (d + 1, LamExpr (Nest b bs) body2)
   _ -> Nothing
-
--- first argument is the number of args expected
-fromNaryPiType :: Int -> Type r n -> Maybe (NaryPiType r n)
-fromNaryPiType n _ | n <= 0 = error "expected positive number of args"
-fromNaryPiType 1 ty = case ty of
-  Pi (PiType b _ effs resultTy) -> Just $ NaryPiType (Nest b Empty) effs resultTy
-  _ -> Nothing
-fromNaryPiType n (Pi (PiType b1 _ Pure piTy)) = do
-  NaryPiType (Nest b2 bs) effs resultTy <- fromNaryPiType (n-1) piTy
-  Just $ NaryPiType (Nest b1 (Nest b2 bs)) effs resultTy
-fromNaryPiType _ _ = Nothing
 
 mkConsListTy :: [Type r n] -> Type r n
 mkConsListTy = foldr PairTy UnitTy
