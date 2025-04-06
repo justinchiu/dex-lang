@@ -19,6 +19,7 @@ import Data.List (foldl')
 import Data.Store (Store (..))
 import GHC.Generics (Generic (..))
 
+import PPrint
 import IRVariants
 import Name
 
@@ -88,12 +89,10 @@ class MaxPlus a where
   max :: a -> a -> a
   plus :: a -> a -> a
 
-instance (MaxPlus a) => MaxPlus (NameMap c a n) where
+instance (MaxPlus (e n)) => MaxPlus (NameMapE c e n) where
   zero = mempty
-  max  = unionWithNameMap max
-  plus = unionWithNameMap plus
-
-deriving instance (MaxPlus (e n)) => MaxPlus (NameMapE c e n)
+  max  = unionWithNameMapE max
+  plus = unionWithNameMapE plus
 
 -- === Access ===
 
@@ -727,6 +726,7 @@ instance MaxPlus UsageInfo where
 usageInfo :: AccessInfo n -> UsageInfo
 usageInfo (AccessInfo s dyn) =
   UsageInfo s $ approxConst $ collapse $ interp dyn
+{-# SCC usageInfo #-}
 
 -- === Notes ===
 
@@ -889,3 +889,15 @@ instance RenameE AccessInfo
 
 instance Hashable UsageInfo
 instance Store UsageInfo
+
+-- === instances ===
+
+instance Pretty UsageInfo where
+  pretty (UsageInfo static (ixDepth, ct)) =
+    "occurs in" <+> pretty static <+> "places, read"
+    <+> pretty ct <+> "times, to depth" <+> pretty (show ixDepth)
+
+instance Pretty Count where
+  pretty = \case
+    Bounded ct -> "<=" <+> pretty ct
+    Unbounded -> "many"

@@ -5,20 +5,19 @@
 ;; https://developers.google.com/open-source/licenses/bsd
 
 (setq dex-highlights
-  `(("--\\([^o].*$\\|$\\)"   . font-lock-comment-face)
+  `(("#.*$"   . font-lock-comment-face)
     ("^> .*$"                . font-lock-comment-face)
     ("^'\\(.\\|\n.\\)*\n\n"  . font-lock-comment-face)
     ("\\w+:"                 . font-lock-comment-face)
     ("^:\\w*"                . font-lock-preprocessor-face)
     (,(concat
        "\\bdef\\b\\|\\bfor\\b\\|\\brof\\b\\|\\bcase\\b\\|"
-       "\\bstruct\\b\\|\\bdata\\b\\|\\bwhere\\b\\|\\bof\\b\\|"
+       "\\bstruct\\b\\|\\benum\\b\\|\\bwhere\\b\\|\\bof\\b\\|"
        "\\bif\\b\\|\\bthen\\b\\|\\belse\\b\\|\\binterface\\b\\|"
        "\\binstance\\b\\|\\bgiven\\b\\|\\bdo\\b\\|\\bview\\b\\|"
        "\\bwith\\b\\|\\bself\\b\\|"
        "\\bimport\\b\\|\\bforeign\\b\\|\\bsatisfying\\b") .
            font-lock-keyword-face)
-    ("--o"                               . font-lock-variable-name-face)
     ("[-.,!;$^&*:~+/=<>|?\\\\]"           . font-lock-variable-name-face)
     ("\\b[[:upper:]][[:alnum:]]*\\b"     . font-lock-type-face)
     ("^@[[:alnum:]]*\\b"     . font-lock-keyword-face)
@@ -36,7 +35,7 @@
 
 (define-derived-mode dex-mode fundamental-mode "dex"
   (setq font-lock-defaults '(dex-highlights))
-  (setq-local comment-start "--")
+  (setq-local comment-start "#")
   (setq-local comment-end "")
   (setq-local syntax-propertize-function
               (syntax-propertize-rules (".>\\( +\\)" (1 "."))))

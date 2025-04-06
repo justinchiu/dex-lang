@@ -30,15 +30,10 @@ import System.IO.Unsafe
 
 import Control.Monad
 
-import Logging
 import PPrint ()
 import Paths_dex  (getDataFileName)
-import Types.Misc
--- The only reason this module depends on Types.Source is that we pass in the logger,
--- in order to optionally print out the IRs. LLVM mutates its IRs in-place, so
--- we can't just expose a functional API for each stage without taking a
--- performance hit. But maybe the performance hit isn't so bad?
 import Types.Source
+import MonadUtil
 
 
 data LLVMOptLevel = OptALittle       -- -O1
@@ -49,11 +44,12 @@ compileLLVM :: PassLogger -> LLVMOptLevel -> L.Module -> String -> IO BS.ByteStr
 compileLLVM logger opt ast exportName = do
   tm <- LLVM.Shims.newDefaultHostTargetMachine
   withContext \c -> do
-    Mod.withModuleFromAST c ast \m -> do
+    {-# SCC "LLVM.Internal.Module.withModuleFromAST" #-} Mod.withModuleFromAST c ast \m -> do
       standardCompilationPipeline opt
         logger
         [exportName] tm m
-      Mod.moduleObject tm m
+      {-# SCC "LLVM.Internal.Module.moduleObject" #-} Mod.moduleObject tm m
+{-# SCC compileLLVM #-}
 
 -- === LLVM passes ===
 
@@ -109,7 +105,11 @@ standardCompilationPipeline opt logger exports tm m = do
   {-# SCC showAssembly      #-} logPass AsmPass $ showAsm tm m
   where
     logPass :: PassName -> IO String -> IO ()
-    logPass passName cont = logFiltered logger passName $ cont >>= \s -> return [PassInfo passName s]
+    logPass passName showIt = do
+      s <- case ioLogLevel logger of
+        DebugLogLevel -> Just <$> showIt
+        NormalLogLevel -> return Nothing
+      ioLogAction logger $ Outputs [PassResult passName s]
 {-# SCC standardCompilationPipeline #-}
 
 internalize :: [String] -> Mod.Module -> IO ()

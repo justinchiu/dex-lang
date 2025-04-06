@@ -14,9 +14,9 @@ license-file:        LICENSE
 build-type:          Simple
 
 data-files:          lib/*.dx
-                   , static/*.css
-                   , static/*.html
-                   , static/*.js
+                   , static/dynamic.html
+                   , static/index.js
+                   , static/style.css
                    , src/lib/dexrt.bc
 
 flag cuda
@@ -26,10 +26,6 @@ flag cuda
 flag optimized
   description:         Enables GHC optimizations
   default:             False
-
-flag live
-  description:         Enables live-editing environments (web notebook and terminal)
-  default:             True
 
 flag llvm-head
   description:         Use the bleeding-edge version of LLVM
@@ -48,7 +44,6 @@ library
                      , Algebra
                      , Builder
                      , CUDA
-                     , Cat
                      , CheapReduction
                      , CheckType
                      , ConcreteSyntax
@@ -58,6 +53,7 @@ library
                      , Generalize
                      , Imp
                      , ImpToLLVM
+                     , IncState
                      , Inference
                      , Inline
                      , IRVariants
@@ -70,13 +66,14 @@ library
                      , LLVM.Shims
                      , Lexing
                      , Linearize
-                     , Logging
                      , Lower
+                     , MonadUtil
                      , MTL1
                      , Name
                      , Occurrence
                      , OccAnalysis
                      , Optimize
+                     , PeepholeOptimize
                      , PPrint
                      , RawName
                      , Runtime
@@ -85,20 +82,21 @@ library
                      , Simplify
                      , Subst
                      , SourceRename
+                     , SourceIdTraversal
                      , TopLevel
                      , Transpose
                      , Types.Core
                      , Types.Imp
-                     , Types.Misc
                      , Types.Primitives
                      , Types.OpNames
                      , Types.Source
+                     , Types.Top
                      , QueryType
+                     , QueryTypePure
                      , Util
-  if flag(live)
-    exposed-modules:   Actor
+                     , Vectorize
+                     , Actor
                      , Live.Eval
-                     , Live.Terminal
                      , Live.Web
                      , RenderHtml
   other-modules:       Paths_dex
@@ -122,7 +120,6 @@ library
                      , prettyprinter
                      , text
                        -- Portable system utilities
-                     , ansi-terminal
                      , directory
                      , filepath
                      , haskeline
@@ -131,17 +128,16 @@ library
                        -- Serialization
                      , aeson
                      , store
+                     , time
                        -- Floating-point pedanticness (correcting for GHC < 9.2.2)
                      , floating-bits
-  if flag(live)
-    build-depends:     binary
+                     , binary
                      , blaze-html
+                     , blaze-markup
                      , cmark
                      , http-types
                      , wai
                      , warp
-    cpp-options:       -DDEX_LIVE
-    cxx-options:       -DDEX_LIVE
   if flag(debug)
     cpp-options:       -DDEX_DEBUG
   default-language:    Haskell2010
@@ -230,6 +226,7 @@ executable dex
   main-is:             dex.hs
   build-depends:       dex
                      , ansi-wl-pprint
+                     , ansi-terminal
                      , base
                      , bytestring
                      , containers
@@ -247,6 +244,7 @@ executable dex
   ghc-options:         -threaded
                        -optP-Wno-nonportable-include-path
                        -rtsopts
+                       -Wall
                        "-with-rtsopts=-I0 -A16m"
   default-extensions:  CPP
                      , DeriveGeneric
@@ -255,8 +253,6 @@ executable dex
                      , BlockArguments
   if flag(cuda)
     cpp-options:       -DDEX_CUDA
-  if flag(live)
-    cpp-options:       -DDEX_LIVE
   if flag(optimized)
     ghc-options:       -O3
   else
@@ -322,12 +318,14 @@ test-suite spec
                      , aeson
                      , aeson-pretty
                      , bytestring
+                     , blaze-html
                      , dex
   other-modules:       ConstantCastingSpec
                      , JaxADTSpec
                      , OccAnalysisSpec
                      , OccurrenceSpec
                      , RawNameSpec
+                     , SourceInfoSpec
   default-language:    Haskell2010
   build-tool-depends:  hspec-discover:hspec-discover
                        -- Mimicking -XGHC2021 in GHC 8.10.1

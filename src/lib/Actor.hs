@@ -1,70 +1,225 @@
--- Copyright 2022 Google LLC
+-- Copyright 2023 Google LLC
 --
 -- Use of this source code is governed by a BSD-style
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
-module Actor (PChan, sendPChan, sendOnly, subChan,
-              Actor, runActor, spawn,
-              LogServerMsg (..), logServer) where
+{-# LANGUAGE UndecidableInstances #-}
 
-import Control.Concurrent (Chan, forkIO, newChan, readChan, ThreadId, writeChan)
+module Actor (
+  ActorM, Actor (..), launchActor, send, selfMailbox, messageLoop,
+  sliceMailbox, SubscribeMsg (..), IncServer, IncServerT, FileWatcher,
+  StateServer, flushDiffs, handleSubscribeMsg, subscribe, subscribeIO, sendSync,
+  runIncServerT, launchFileWatcher, Mailbox,
+  ) where
+
+import Control.Concurrent
+import Control.Monad
 import Control.Monad.State.Strict
+import Control.Monad.Reader
+import Data.IORef
+import Data.Text (Text)
+import System.Directory (getModificationTime)
+import GHC.Generics
 
-import Util (onFst, onSnd)
+import IncState
+import MonadUtil
+import Util (readFileText)
 
--- Micro-actors.
+-- === Actor implementation ===
 
--- In this model, an "actor" is just an IO computation (presumably
--- running on its own Haskell thread) that receives messages on a
--- Control.Concurrent.Chan channel.  The idea is that the actor thread
--- only receives information (or synchronization) from other threads
--- through messages sent on that one channel, and no other thread
--- reads messages from that channel.
+newtype ActorM msg a = ActorM { runActorM ::  ReaderT (Chan msg) IO a }
+  deriving (Functor, Applicative, Monad, MonadIO)
 
--- We start the actor with a two-way view of its input channel so it
--- can subscribe itself to message streams by passing (a send-only
--- view of) it to another actor.
-type Actor a = Chan a -> IO ()
+newtype Mailbox a = Mailbox { sendToMailbox :: a -> IO () }
 
--- We also define a send-only channel type, to help ourselves not
--- accidentally read from channels we aren't supposed to.
-newtype PChan a = PChan { sendPChan :: a -> IO () }
+class (MonadIO m) => Actor msg m | m -> msg where
+  selfChan :: m (Chan msg)
 
-sendOnly :: Chan a -> PChan a
-sendOnly chan = PChan $ \ !x -> writeChan chan x
+instance Actor msg (ActorM msg) where
+  selfChan = ActorM ask
 
-subChan :: (a -> b) -> PChan b -> PChan a
-subChan f chan = PChan (sendPChan chan . f)
+instance Actor msg m => Actor msg (ReaderT r m) where selfChan = lift $ selfChan
+instance Actor msg m => Actor msg (StateT  s m) where selfChan = lift $ selfChan
 
--- Synchronously execute an actor.
-runActor :: Actor a -> IO ()
-runActor actor = newChan >>= actor
+send :: MonadIO m => Mailbox msg -> msg -> m ()
+send chan msg = liftIO $ sendToMailbox chan msg
 
--- Asynchronously launch an actor.  Immediately returns permission to
--- kill that actor and to send it messages.
-spawn :: Actor a -> IO (ThreadId, PChan a)
-spawn actor = do
+selfMailbox :: Actor msg m => (a -> msg) -> m (Mailbox a)
+selfMailbox asSelfMessage = do
+  chan <- selfChan
+  return $ Mailbox \msg -> writeChan chan (asSelfMessage msg)
+
+launchActor :: MonadIO m => ActorM msg () -> m (Mailbox msg)
+launchActor m = liftIO do
   chan <- newChan
-  tid <- forkIO $ actor chan
-  return (tid, sendOnly chan)
+  void $ forkIO $ runReaderT (runActorM m) chan
+  return $ Mailbox \msg -> writeChan chan msg
 
--- A log server.  Combines inputs monoidally and pushes incremental
--- updates to subscribers.
+messageLoop :: Actor msg m => (msg -> m ()) -> m ()
+messageLoop handleMessage = do
+  forever do
+    msg <- liftIO . readChan =<< selfChan
+    handleMessage msg
 
-data LogServerMsg a = Subscribe (PChan a)
-                    | Publish a
+sliceMailbox :: (b -> a) -> Mailbox a -> Mailbox b
+sliceMailbox f (Mailbox sendMsg) = Mailbox $ sendMsg . f
 
-logServer :: Monoid a => Actor (LogServerMsg a)
-logServer self = flip evalStateT (mempty, []) $ forever $ do
-  msg <- liftIO $ readChan self
-  case msg of
-    Subscribe chan -> do
-      curVal <- gets fst
-      liftIO $ chan `sendPChan` curVal
-      modify $ onSnd (chan:)
-    Publish x -> do
-      modify $ onFst (<> x)
-      subscribers <- gets snd
-      mapM_ (liftIO . (`sendPChan` x)) subscribers
+-- === Promises ===
 
+newtype Promise a = Promise (MVar a)
+newtype PromiseSetter a = PromiseSetter (MVar a)
+
+newPromise :: MonadIO m => m (Promise a, PromiseSetter a)
+newPromise = do
+  v <- liftIO $ newEmptyMVar
+  return (Promise v, PromiseSetter v)
+
+waitForPromise :: MonadIO m => Promise a -> m a
+waitForPromise (Promise v) = liftIO $ readMVar v
+
+setPromise :: MonadIO m => PromiseSetter a -> a -> m ()
+setPromise (PromiseSetter v) x = liftIO $ putMVar v x
+
+-- Message that expects a synchronous reponse
+data SyncMsg msg response = SyncMsg msg (PromiseSetter response)
+
+sendSync :: MonadIO m => Mailbox (SyncMsg msg response) -> msg -> m response
+sendSync mailbox msg = do
+  (result, resultSetter) <- newPromise
+  send mailbox (SyncMsg msg resultSetter)
+  waitForPromise result
+
+
+-- === Diff server ===
+
+data IncServerState s = IncServerState
+  { subscribers     :: [Mailbox (Delta s)]
+  , bufferedUpdates :: Delta s
+  , curIncState     :: s }
+  deriving (Generic)
+
+class (IncState s, MonadIO m) => IncServer s m | m -> s where
+  getIncServerStateRef :: m (IORef (IncServerState s))
+
+data SubscribeMsg s = Subscribe (SyncMsg (Mailbox (Delta s)) s)  deriving (Show)
+
+getIncServerState :: IncServer s m => m (IncServerState s)
+getIncServerState = readRef =<< getIncServerStateRef
+
+updateIncServerState :: IncServer s m => (IncServerState s -> IncServerState s) -> m ()
+updateIncServerState f = do
+  ref <- getIncServerStateRef
+  prev <- readRef ref
+  writeRef ref $ f prev
+
+handleSubscribeMsg :: IncServer s m => SubscribeMsg s -> m ()
+handleSubscribeMsg (Subscribe (SyncMsg newSub response)) = do
+  flushDiffs
+  updateIncServerState \s -> s { subscribers = newSub : subscribers s }
+  curState <- curIncState <$> getIncServerState
+  setPromise response curState
+
+flushDiffs :: IncServer s m => m ()
+flushDiffs = do
+  d <- bufferedUpdates <$> getIncServerState
+  updateIncServerState \s -> s { bufferedUpdates = mempty }
+  subs <- subscribers <$> getIncServerState
+  -- TODO: consider testing for emptiness here
+  forM_ subs \sub -> send sub d
+
+type StateServer s = Mailbox (SubscribeMsg s)
+
+subscribe :: (IncState s, Actor msg m) => (Delta s -> msg) -> StateServer s -> m s
+subscribe inject server = do
+  updateChannel <- selfMailbox inject
+  sendSync (sliceMailbox Subscribe server) updateChannel
+
+subscribeIO :: IncState s => StateServer s -> IO (s, Chan (Delta s))
+subscribeIO server = do
+  chan <- newChan
+  let mailbox = Mailbox (writeChan chan)
+  s <- sendSync (sliceMailbox Subscribe server) mailbox
+  return (s, chan)
+
+newtype IncServerT s m a = IncServerT { runIncServerT' :: ReaderT (Ref (IncServerState s)) m a }
+  deriving (Functor, Applicative, Monad, MonadIO, Actor msg, FreshNames name, MonadTrans)
+
+instance (MonadIO m, IncState s) => IncServer s (IncServerT s m) where
+  getIncServerStateRef = IncServerT ask
+
+instance (MonadIO m, IncState s, d ~ Delta s) => DefuncState d (IncServerT s m) where
+  update d = updateIncServerState \s -> s
+    { bufferedUpdates = bufferedUpdates s <> d
+    , curIncState     = curIncState     s `applyDiff` d}
+
+instance (MonadIO m, IncState s) => LabelReader (SingletonLabel s) (IncServerT s m) where
+  getl It = curIncState <$> getIncServerState
+
+runIncServerT :: (MonadIO m, IncState s) => s -> IncServerT s m a -> m a
+runIncServerT s cont = do
+  ref <- newRef $ IncServerState [] mempty s
+  runReaderT (runIncServerT' cont) ref
+
+-- === Refs ===
+-- Just a wrapper around IORef lifted to `MonadIO`
+
+type Ref = IORef
+
+newRef :: MonadIO m => a -> m (Ref a)
+newRef = liftIO . newIORef
+
+readRef :: MonadIO m => Ref a -> m a
+readRef = liftIO . readIORef
+
+writeRef :: MonadIO m => Ref a -> a -> m ()
+writeRef ref val = liftIO $ writeIORef ref val
+
+-- === Clock ===
+
+-- Provides a periodic clock signal. The time interval is in microseconds.
+launchClock :: MonadIO m => Int -> Mailbox () -> m ()
+launchClock intervalMicroseconds mailbox =
+  liftIO $ void $ forkIO $ forever do
+    threadDelay intervalMicroseconds
+    send mailbox ()
+
+-- === File watcher ===
+
+type SourceFileContents = Text
+type FileWatcher = StateServer (Overwritable SourceFileContents)
+
+data FileWatcherMsg =
+   ClockSignal_FW ()
+ | Subscribe_FW (SubscribeMsg (Overwritable Text))
+   deriving (Show)
+
+launchFileWatcher :: MonadIO m => FilePath -> m FileWatcher
+launchFileWatcher path = sliceMailbox Subscribe_FW <$> launchActor (fileWatcherImpl path)
+
+fileWatcherImpl :: FilePath -> ActorM FileWatcherMsg ()
+fileWatcherImpl path = do
+  initContents <- readFileText path
+  t0 <- liftIO $ getModificationTime path
+  launchClock 100000 =<< selfMailbox ClockSignal_FW
+  modTimeRef <- newRef t0
+  runIncServerT (Overwritable initContents) $ messageLoop \case
+    Subscribe_FW msg -> handleSubscribeMsg msg
+    ClockSignal_FW () -> do
+      tOld <- readRef modTimeRef
+      tNew <- liftIO $ getModificationTime path
+      when (tNew /= tOld) do
+        newContents <- readFileText path
+        update $ OverwriteWith newContents
+        flushDiffs
+        writeRef modTimeRef tNew
+
+-- === instances ===
+
+instance Show msg => Show (SyncMsg msg response) where
+  show (SyncMsg msg _) = show msg
+
+instance Show (Mailbox a) where
+  show _ = "mailbox"
+
+deriving instance Actor msg m => Actor msg (FreshNameT m)

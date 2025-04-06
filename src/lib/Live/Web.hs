@@ -4,7 +4,7 @@
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
-module Live.Web (runWeb) where
+module Live.Web (runWeb, generateHTML) where
 
 import Control.Concurrent (readChan)
 import Control.Monad (forever)
@@ -14,12 +14,13 @@ import Network.Wai (Application, StreamingBody, pathInfo,
 import Network.Wai.Handler.Warp (run)
 import Network.HTTP.Types (status200, status404)
 import Data.Aeson (ToJSON, encode)
-import Data.Binary.Builder (fromByteString, Builder)
+import Data.Binary.Builder (fromByteString)
 import Data.ByteString.Lazy (toStrict)
+import qualified Data.ByteString as BS
+import System.Directory (withCurrentDirectory)
 
-import Paths_dex (getDataFileName)
-
-import Actor
+-- import Paths_dex (getDataFileName)
+import RenderHtml
 import Live.Eval
 import TopLevel
 
@@ -29,7 +30,17 @@ runWeb fname opts env = do
   putStrLn "Streaming output to http://localhost:8000/"
   run 8000 $ serveResults resultsChan
 
-serveResults :: ToJSON a => PChan (PChan a) -> Application
+pagesDir :: FilePath
+pagesDir = "pages"
+
+generateHTML :: FilePath -> FilePath -> EvalConfig -> TopStateEx -> IO ()
+generateHTML sourcePath destPath cfg env = do
+  finalState <- evalFileNonInteractive sourcePath cfg env
+  results <- renderResults finalState
+  withCurrentDirectory pagesDir do
+    renderStandaloneHTML destPath results
+
+serveResults :: EvalServer -> Application
 serveResults resultsSubscribe request respond = do
   print (pathInfo request)
   case pathInfo request of
@@ -44,16 +55,21 @@ serveResults resultsSubscribe request respond = do
            [("Content-Type", "text/plain")] "404 - Not Found"
   where
     respondWith dataFname ctype = do
-      fname <- getDataFileName dataFname
+      fname <- return dataFname -- lets us skip rebuilding during development
+      -- fname <- getDataFileName dataFname
       respond $ responseFile status200 [("Content-Type", ctype)] fname Nothing
 
-resultStream :: ToJSON a => PChan (PChan a) -> StreamingBody
-resultStream resultsSubscribe write flush = runActor \self -> do
-  write (makeBuilder ("start"::String)) >> flush
-  resultsSubscribe `sendPChan` (sendOnly self)
-  forever $ do msg <- readChan self
-               write (makeBuilder msg) >> flush
+resultStream :: EvalServer -> StreamingBody
+resultStream resultsServer write flush = do
+  sendUpdate ("start"::String)
+  (initResult, resultsChan) <- subscribeIO resultsServer
+  (renderedInit, renderUpdateFun) <- renderResultsInc initResult
+  sendUpdate renderedInit
+  forever $ readChan resultsChan >>= renderUpdateFun >>= sendUpdate
+  where
+    sendUpdate :: ToJSON a => a -> IO ()
+    sendUpdate x = write (fromByteString $ encodePacket x) >> flush
 
-makeBuilder :: ToJSON a => a -> Builder
-makeBuilder = fromByteString . toStrict . wrap . encode
+encodePacket :: ToJSON a => a -> BS.ByteString
+encodePacket = toStrict . wrap . encode
   where wrap s = "data:" <> s <> "\n\n"

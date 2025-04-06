@@ -39,6 +39,11 @@
 # center insertion.  This way (i) you're profiling optimized rather
 # than unoptimized Dex, and (ii) the profile data is restricted to our
 # {-# SCC #-} annotations, and thus not as overwhelming.
+# - As a reminder, runtime profiling is turned on by passing +RTS -p
+#   -RTS to `dexprof`; you can read the resulting .prof file directly,
+#   or postprocess it into a more legible form by for example
+#   running `profiteur` on it and browsing the HTML page so
+#   created.
 #
 # We keep the builds in separate .stack-work directories so they don't
 # step on each other's GHC-level compilation caches.
@@ -141,11 +146,14 @@ all: build
 tc: dexrt-llvm
 	$(STACK) build $(STACK_FLAGS) --ghc-options -fno-code
 
+static/index.js: static/index.ts
+	tsc --strict --lib es2015,dom static/index.ts
+
 # Build without clearing the cache. Use at your own risk.
-just-build: dexrt-llvm
+just-build: dexrt-llvm static/index.js
 	$(STACK) build $(STACK_FLAGS)
 
-build: dexrt-llvm
+build: dexrt-llvm static/index.js
 	$(STACK) build $(STACK_FLAGS) --fast
 	$(dex) clean             # clear cache
 	$(dex) script /dev/null  # precompile the prelude
@@ -207,11 +215,13 @@ example-names := \
   regression brownian_motion particle-swarm-optimizer \
   ode-integrator mcmc ctc raytrace particle-filter \
   fluidsim \
-  sgd psd kernelregression nn \
+  sgd nn \
   quaternions manifold-gradients schrodinger tutorial \
-  latex linear-maps dither mcts md
+  latex dither mcts md bfgs
+
 # TODO: re-enable
 # fft vega-plotting
+# examples depending on linalg: linear-maps, psd, kernelregression
 
 # Only test levenshtein-distance on Linux, because MacOS ships with a
 # different (apparently _very_ different) word list.
@@ -403,39 +413,48 @@ bench-summary:
 
 # --- building docs ---
 
-slow-pages = pages/examples/mnist-nearest-neighbors.html
+slow-pages = pages/dex-lang/examples/mnist-nearest-neighbors.html
+static-names = dynamic.html index.js style.css
 
 doc-files = $(doc-names:%=doc/%.dx)
-pages-doc-files = $(doc-names:%=pages/%.html)
+pages-doc-files = $(doc-names:%=pages/dex-lang/%.html)
 example-files = $(example-names:%=examples/%.dx)
-pages-example-files = $(example-names:%=pages/examples/%.html)
+pages-example-files = $(example-names:%=pages/dex-lang/examples/%.html)
 
 lib-files = $(filter-out lib/prelude.dx,$(wildcard lib/*.dx))
-pages-lib-files = $(patsubst %.dx,pages/%.html,$(lib-files))
+pages-lib-files = $(patsubst %.dx,pages/dex-lang/%.html,$(lib-files))
+static-files = $(static-names:%=pages/dex-lang/static/%)
 
-docs: pages-prelude $(pages-doc-files) $(pages-example-files) $(pages-lib-files) $(slow-pages) pages/index.md
+serve-docs:
+	cd pages && python3 -m http.server
+
+docs: $(static-files) pages-prelude $(pages-doc-files) $(pages-example-files) $(pages-lib-files) $(slow-pages) pages/dex-lang/index.md
+
+pages/dex-lang/static/%: static/%
+	mkdir -p pages/dex-lang/static
+	cp $^ $@
 
 pages-prelude: lib/prelude.dx
-	mkdir -p pages
-	$(dex) --prelude /dev/null script lib/prelude.dx --outfmt html > pages/prelude.html
+	mkdir -p pages/dex-lang/lib
+	$(dex) --prelude /dev/null generate-html lib/prelude.dx dex-lang/lib/prelude
 
-pages/examples/tutorial.html: tutorial-data
-pages/examples/dither.html: dither-data
+pages/dex-lang/examples/tutorial.html: tutorial-data
+pages/dex-lang/examples/dither.html: dither-data
 
-pages/examples/%.html: examples/%.dx
-	mkdir -p pages/examples
-	$(dex) script $< --outfmt html > $@
+pages/dex-lang/examples/%.html: examples/%.dx
+	mkdir -p pages/dex-lang/examples
+	$(dex) generate-html $< dex-lang/examples/$*
 
-pages/lib/%.html: lib/%.dx
-	mkdir -p pages/lib
-	$(dex) script $^ --outfmt html > $@
+pages/dex-lang/lib/%.html: lib/%.dx
+	mkdir -p pages/dex-lang/lib
+	$(dex) generate-html $^ dex-lang/lib/$*
 
-pages/index.md: $(doc-files) $(example-files) $(lib-files)
+pages/dex-lang/index.md: $(doc-files) $(example-files) $(lib-files)
 	python3 misc/build-web-index "$(doc-files)" "$(example-files)" "$(lib-files)" > $@
 
-${pages-doc-files}:pages/%.html: doc/%.dx
-	mkdir -p pages
-	$(dex) script $^ --outfmt html > $@
+${pages-doc-files}:pages/dex-lang/%.html: doc/%.dx
+	mkdir -p pages/dex-lang
+	$(dex) generate-html $^ dex-lang/$*
 
 clean:
 	$(STACK) clean

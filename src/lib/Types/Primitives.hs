@@ -22,23 +22,25 @@ module Types.Primitives (
   module Types.Primitives, UnOp (..), BinOp (..),
   CmpOp (..), Projection (..)) where
 
-import Name
 import qualified Data.ByteString       as BS
-import Control.Monad
 import Data.Int
+import Data.String (IsString (..))
 import Data.Word
 import Data.Hashable
 import Data.Store (Store (..))
 import qualified Data.Store.Internal as SI
 import Foreign.Ptr
+import Numeric
 
+import GHC.Float
 import GHC.Generics (Generic (..))
 
+import PPrint
 import Occurrence
-import Util (zipErr)
 import Types.OpNames (UnOp (..), BinOp (..), CmpOp (..), Projection (..))
+import Name
 
-type SourceName = String
+newtype SourceName = MkSourceName String  deriving (Show, Eq, Ord, Generic)
 
 newtype AlwaysEqual a = AlwaysEqual a
         deriving (Show, Generic, Functor, Foldable, Traversable, Hashable, Store)
@@ -58,30 +60,16 @@ data Explicitness =
 data AppExplicitness = ExplicitApp | ImplicitApp  deriving (Show, Generic, Eq)
 data DepPairExplicitness = ExplicitDepPair | ImplicitDepPair  deriving (Show, Generic, Eq)
 
-data WithExpl (b::B) (n::S) (l::S) =
-  WithExpl { getExpl :: Explicitness , withoutExpl :: b n l }
-  deriving (Show, Generic)
-
-unzipExpls :: Nest (WithExpl b) n l -> ([Explicitness], Nest b n l)
-unzipExpls Empty = ([], Empty)
-unzipExpls (Nest (WithExpl expl b) rest) = (expl:expls, Nest b bs)
-  where (expls, bs) = unzipExpls rest
-
-zipExpls :: [Explicitness] -> Nest b n l -> Nest (WithExpl b) n l
-zipExpls [] Empty = Empty
-zipExpls (expl:expls) (Nest b bs) = Nest (WithExpl expl b) (zipExpls expls bs)
-zipExpls _ _ = error "zip error"
-
-addExpls :: Explicitness -> Nest b n l -> Nest (WithExpl b) n l
-addExpls expl bs = fmapNest (\b -> WithExpl expl b) bs
-
 data RequiredMethodAccess = Full | Partial Int deriving (Show, Eq, Ord, Generic)
 
 data LetAnn =
   -- Binding with no additional information
     PlainLet
+  -- Binding explicitly tagged "inline immediately"
+  | InlineLet
   -- Binding explicitly tagged "do not inline"
   | NoInlineLet
+  | LinearLet
   -- Bound expression is pure, and the binding's occurrences are summarized by
   -- the UsageInfo
   | OccInfoPure UsageInfo
@@ -198,6 +186,16 @@ emptyLit = \case
 
 -- === Typeclass instances ===
 
+instance HasNameHint SourceName where
+  getNameHint (MkSourceName v) = getNameHint v
+
+instance Pretty SourceName where
+  pretty (MkSourceName v) = pretty v
+
+instance IsString SourceName where
+  fromString v = MkSourceName v
+
+instance Store SourceName
 instance Store RequiredMethodAccess
 instance Store LetAnn
 instance Store RWS
@@ -211,6 +209,7 @@ instance Store AppExplicitness
 instance Store DepPairExplicitness
 instance Store InferenceMechanism
 
+instance Hashable SourceName
 instance Hashable RWS
 instance Hashable Direction
 instance Hashable BaseType
@@ -226,39 +225,74 @@ instance Hashable DepPairExplicitness
 instance Hashable InferenceMechanism
 instance Hashable RequiredMethodAccess
 
-instance Store (b n l) => Store (WithExpl b n l)
+-- === Pretty instances ===
 
-instance (Color c, BindsOneName b c) => BindsOneName (WithExpl b) c where
-  binderName (WithExpl _ b) = binderName b
-  asNameBinder (WithExpl _ b) = asNameBinder b
+instance Pretty AppExplicitness where
+  pretty ExplicitApp = "->"
+  pretty ImplicitApp = "->>"
 
-instance (Color c, BindsAtMostOneName b c) => BindsAtMostOneName (WithExpl b) c where
-  WithExpl _ b @> x = b @> x
-  {-# INLINE (@>) #-}
+instance Pretty RWS where
+  pretty eff = case eff of
+    Reader -> "Read"
+    Writer -> "Accum"
+    State  -> "State"
 
-instance AlphaEqB b => AlphaEqB (WithExpl b) where
-  withAlphaEqB (WithExpl a1 b1) (WithExpl a2 b2) cont = do
-    unless (a1 == a2) zipErr
-    withAlphaEqB b1 b2 cont
+instance Pretty LetAnn where
+  pretty ann = case ann of
+    PlainLet        -> ""
+    InlineLet       -> "%inline"
+    NoInlineLet     -> "%noinline"
+    LinearLet       -> "%linear"
+    OccInfoPure   u -> pretty u <> hardline
+    OccInfoImpure u -> pretty u <> ", impure" <> hardline
 
-instance AlphaHashableB b => AlphaHashableB (WithExpl b) where
-  hashWithSaltB env salt (WithExpl expl b) = do
-    let h = hashWithSalt salt expl
-    hashWithSaltB env h b
+instance PrettyPrec Direction where
+  prettyPrec d = atPrec ArgPrec $ case d of
+    Fwd -> "fwd"
+    Rev -> "rev"
 
-instance BindsNames b => ProvesExt  (WithExpl b) where
-instance BindsNames b => BindsNames (WithExpl b) where
-  toScopeFrag (WithExpl _ b) = toScopeFrag b
+printDouble :: Double -> Doc ann
+printDouble x = pretty (double2Float x)
 
-instance (SinkableB b) => SinkableB (WithExpl b) where
-  sinkingProofB fresh (WithExpl a b) cont =
-    sinkingProofB fresh b \fresh' b' ->
-      cont fresh' (WithExpl a b')
+printFloat :: Float -> Doc ann
+printFloat x = pretty $ reverse $ dropWhile (=='0') $ reverse $
+  showFFloat (Just 6) x ""
 
-instance (BindsNames b, RenameB b) => RenameB (WithExpl b) where
-  renameB env (WithExpl a b) cont =
-      renameB env b \env' b' ->
-        cont env' $ WithExpl a b'
+instance Pretty LitVal where pretty = prettyFromPrettyPrec
+instance PrettyPrec LitVal where
+  prettyPrec = \case
+    Int64Lit   x -> atPrec ArgPrec $ p x
+    Int32Lit   x -> atPrec ArgPrec $ p x
+    Float64Lit x -> atPrec ArgPrec $ printDouble x
+    Float32Lit x -> atPrec ArgPrec $ printFloat  x
+    Word8Lit   x -> atPrec ArgPrec $ p $ show $ toEnum @Char $ fromIntegral x
+    Word32Lit  x -> atPrec ArgPrec $ p $ "0x" ++ showHex x ""
+    Word64Lit  x -> atPrec ArgPrec $ p $ "0x" ++ showHex x ""
+    PtrLit ty (PtrLitVal x) -> atPrec ArgPrec $ "Ptr" <+> p ty <+> p (show x)
+    PtrLit _ NullPtr -> atPrec ArgPrec $ "NullPtr"
+    PtrLit _ (PtrSnapshot _) -> atPrec ArgPrec "<ptr snapshot>"
+    where p :: Pretty a => a -> Doc ann
+          p = pretty
 
-instance HoistableB b => HoistableB (WithExpl b) where
-  freeVarsB (WithExpl _ b) = freeVarsB b
+instance Pretty Device where pretty = fromString . show
+
+instance Pretty BaseType where pretty = prettyFromPrettyPrec
+instance PrettyPrec BaseType where
+  prettyPrec b = case b of
+    Scalar sb -> prettyPrec sb
+    Vector shape sb -> atPrec ArgPrec $ encloseSep "<" ">" "x" $ (pretty <$> shape) ++ [pretty sb]
+    PtrType ty -> atPrec AppPrec $ "Ptr" <+> pretty ty
+
+instance Pretty ScalarBaseType where pretty = prettyFromPrettyPrec
+instance PrettyPrec ScalarBaseType where
+  prettyPrec sb = atPrec ArgPrec $ case sb of
+    Int64Type   -> "Int64"
+    Int32Type   -> "Int32"
+    Float64Type -> "Float64"
+    Float32Type -> "Float32"
+    Word8Type   -> "Word8"
+    Word32Type  -> "Word32"
+    Word64Type  -> "Word64"
+
+instance Pretty Explicitness where
+  pretty expl = pretty (show expl)

@@ -14,6 +14,8 @@ import Data.Hashable
 import GHC.Generics (Generic (..))
 import Data.Store (Store (..))
 
+import PPrint
+
 data TC = ProdType | SumType | RefType | TypeKind | HeapType
 data Con = ProdCon | SumCon Int | HeapVal
 
@@ -34,7 +36,7 @@ data MiscOp =
  | ThrowError | ThrowException | Tag | SumTag | Create | ToEnum
  | OutputStream | ShowAny | ShowScalar
 
-data VectorOp  = VectorBroadcast | VectorIota | VectorSubref
+data VectorOp  = VectorBroadcast | VectorIota | VectorIdx | VectorSubref
 
 data Hof  (r::IR) =
    While | RunReader | RunWriter | RunState | RunIO | RunInit
@@ -117,3 +119,8 @@ deriving instance Eq (Hof r)
 deriving instance Eq DAMOp
 deriving instance Eq RefOp
 deriving instance Eq UserEffectOp
+
+instance Pretty Projection where
+  pretty = \case
+    UnwrapNewtype -> "u"
+    ProjectProduct i -> pretty i

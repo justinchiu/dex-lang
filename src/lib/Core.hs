@@ -37,6 +37,7 @@ import Err
 import IRVariants
 
 import Types.Core
+import Types.Top
 import Types.Imp
 import Types.Primitives
 import Types.Source
@@ -79,7 +80,7 @@ type EnvExtender2 (m::MonadKind2) = forall (n::S). EnvExtender (m n)
 newtype EnvReaderT (m::MonadKind) (n::S) (a:: *) =
   EnvReaderT {runEnvReaderT' :: ReaderT (DistinctEvidence n, Env n) m a }
   deriving ( Functor, Applicative, Monad, MonadFail
-           , MonadWriter w, Fallible, Searcher, Alternative)
+           , MonadWriter w, Fallible, Alternative)
 
 type EnvReaderM = EnvReaderT Identity
 
@@ -131,21 +132,12 @@ instance MonadIO m => MonadIO (EnvReaderT m n) where
 
 deriving instance (Monad m, MonadState s m) => MonadState s (EnvReaderT m o)
 
+instance (Monad m, Catchable m) => Catchable (EnvReaderT m o) where
+  catchErr (EnvReaderT (ReaderT m)) f = EnvReaderT $ ReaderT \env ->
+    m env `catchErr` \err -> runReaderT (runEnvReaderT' $ f err) env
+  {-# INLINE catchErr #-}
+
 -- === Instances for Name monads ===
-
-instance (SinkableE e, EnvReader m)
-         => EnvReader (OutReaderT e m) where
-  unsafeGetEnv = OutReaderT $ lift $ unsafeGetEnv
-  {-# INLINE unsafeGetEnv #-}
-
-instance (SinkableE e, ScopeReader m, EnvExtender m)
-         => EnvExtender (OutReaderT e m) where
-  refreshAbs ab cont = OutReaderT $ ReaderT \env ->
-    refreshAbs ab \b e -> do
-      let OutReaderT (ReaderT cont') = cont b e
-      env' <- sinkM env
-      cont' env'
-  {-# INLINE refreshAbs #-}
 
 instance (Monad m, ExtOutMap Env decls, OutFrag decls)
          => EnvReader (InplaceT Env decls m) where
@@ -214,23 +206,16 @@ instance IRRep r => BindsEnv (Decl r) where
   toEnvFrag (Let b binding) = toEnvFrag $ b :> binding
   {-# INLINE toEnvFrag #-}
 
-instance BindsEnv TopEnvFrag where
-  toEnvFrag = undefined
-
 instance BindsEnv EnvFrag where
   toEnvFrag frag = frag
   {-# INLINE toEnvFrag #-}
 
-instance BindsEnv b => BindsEnv (WithExpl b) where
-  toEnvFrag (WithExpl _ b) = toEnvFrag b
-  {-# INLINE toEnvFrag #-}
-
-instance BindsEnv RolePiBinder where
-  toEnvFrag (RolePiBinder _ b) = toEnvFrag b
-  {-# INLINE toEnvFrag #-}
-
 instance BindsEnv (RecSubstFrag Binding) where
   toEnvFrag frag = EnvFrag frag
+
+instance BindsEnv b => BindsEnv (WithAttrB a b) where
+  toEnvFrag (WithAttrB _ b) = toEnvFrag b
+  {-# INLINE toEnvFrag #-}
 
 instance (BindsEnv b1, BindsEnv b2)
          => (BindsEnv (PairB b1 b2)) where
@@ -350,18 +335,6 @@ lookupInstanceTy :: EnvReader m => InstanceName n -> m n (CorePiType n)
 lookupInstanceTy name = lookupEnv name >>= \case InstanceBinding _ ty -> return ty
 {-# INLINE lookupInstanceTy #-}
 
-lookupEffectDef :: EnvReader m => EffectName n -> m n (EffectDef n)
-lookupEffectDef name = lookupEnv name >>= \case EffectBinding x -> return x
-{-# INLINE lookupEffectDef #-}
-
-lookupEffectOpDef :: EnvReader m => EffectOpName n -> m n (EffectOpDef n)
-lookupEffectOpDef name = lookupEnv name >>= \case EffectOpBinding x -> return x
-{-# INLINE lookupEffectOpDef #-}
-
-lookupHandlerDef :: EnvReader m => HandlerName n -> m n (HandlerDef n)
-lookupHandlerDef name = lookupEnv name >>= \case HandlerBinding x -> return x
-{-# INLINE lookupHandlerDef #-}
-
 lookupSourceMapPure :: SourceMap n -> SourceName -> [SourceNameDef n]
 lookupSourceMapPure (SourceMap m) v = M.findWithDefault [] v m
 {-# INLINE lookupSourceMapPure #-}
@@ -370,7 +343,7 @@ lookupSourceMap :: EnvReader m => SourceName -> m n (Maybe (UVar n))
 lookupSourceMap sourceName = do
   sm <- withEnv $ envSourceMap . moduleEnv
   case lookupSourceMapPure sm sourceName of
-    LocalVar x:_  -> return $ Just x
+    LocalVar _ x:_  -> return $ Just x
     [ModuleVar _ (Just x)] -> return $ Just x
     _   -> return Nothing
 
@@ -407,52 +380,6 @@ withFreshBinders (binding:rest) cont = do
       cont (Nest b bs)
            (sink (binderName b) : vs)
 
-getLambdaDicts :: EnvReader m => m n [AtomName CoreIR n]
-getLambdaDicts = do
-  env <- withEnv moduleEnv
-  return $ lambdaDicts $ envSynthCandidates env
-{-# INLINE getLambdaDicts #-}
-
-getInstanceDicts :: EnvReader m => ClassName n -> m n [InstanceName n]
-getInstanceDicts name = do
-  env <- withEnv moduleEnv
-  return $ M.findWithDefault [] name $ instanceDicts $ envSynthCandidates env
-{-# INLINE getInstanceDicts #-}
-
-nonDepPiType :: EnvReader m
-             => [CType n] -> EffectRow CoreIR n -> CType n -> m n (CorePiType n)
-nonDepPiType argTys eff resultTy = do
-  Abs bs (PairE eff' resultTy') <- typesAsBinderNest argTys (PairE eff resultTy)
-  let bs' = fmapNest (WithExpl Explicit) bs
-  return $ CorePiType ExplicitApp bs' eff' resultTy'
-
-typesAsBinderNest
-  :: forall m r n e. (EnvReader m, IRRep r, SinkableE e)
-  => [Type r n] -> e n -> m n (Abs (Nest (Binder r)) e n)
-typesAsBinderNest types body =
-  getDistinct >>= \Distinct -> liftEnvReaderM $ go types
-  where
-    go :: forall l.  DExt n l => [Type r l] -> EnvReaderM l (Abs (Nest (Binder r)) e l)
-    go = \case
-      [] -> Abs Empty <$> sinkM body
-      ty:rest -> withFreshBinder noHint ty \b -> do
-        Abs bs body' <- go $ map sink rest
-        return $ Abs (Nest b bs) body'
-
-nonDepTabPiType :: (IRRep r, ScopeReader m) => IxType r n -> Type r n -> m n (TabPiType r n)
-nonDepTabPiType argTy resultTy =
-  toConstAbs resultTy >>= \case
-    Abs b resultTy' -> return $ TabPiType (b:>argTy) resultTy'
-
-(==>) :: (IRRep r, ScopeReader m) => IxType r n -> Type r n -> m n (Type r n)
-a ==> b = TabPi <$> nonDepTabPiType a b
-
-finTabTyCore :: EnvReader m => CAtom n -> CType n -> m n (CType n)
-finTabTyCore n eltTy = IxType (FinTy n) (IxDictAtom (DictCon (IxFin n))) ==> eltTy
-
-finIxTy :: Int -> IxType r n
-finIxTy n = IxType IdxRepTy (IxDictRawFin (IdxRepVal $ fromIntegral n))
-
 -- These `fromNary` functions traverse a chain of unary structures (LamExpr,
 -- TabLamExpr, CorePiType, respectively) up to the given maxDepth, and return the
 -- discovered binders packed as the nary structure (NaryLamExpr or PiType),
@@ -463,83 +390,25 @@ finIxTy n = IxType IdxRepTy (IxDictRawFin (IdxRepVal $ fromIntegral n))
 -- - The `exact` versions only succeed if at least maxDepth binders were
 --   present, in which case exactly maxDepth binders are packed into the nary
 --   structure.  Excess binders, if any, are still left in the unary structures.
-blockEffects :: IRRep r => Block r n -> EffectRow r n
-blockEffects (Block blockAnn _ _) = case blockAnn of
-  NoBlockAnn -> Pure
-  BlockAnn _ eff -> eff
 
 liftLamExpr :: (IRRep r, EnvReader m)
-  => (forall l m2. EnvReader m2 => Block r l -> m2 l (Block r l))
-  -> LamExpr r n -> m n (LamExpr r n)
-liftLamExpr f (LamExpr bs body) = liftEnvReaderM $
+  => TopLam r n
+  -> (forall l m2. EnvReader m2 => Expr r l -> m2 l (Expr r l))
+  -> m n (TopLam r n)
+liftLamExpr (TopLam d ty (LamExpr bs body)) f = liftM (TopLam d ty) $ liftEnvReaderM $
   refreshAbs (Abs bs body) \bs' body' -> LamExpr bs' <$> f body'
-
-destBlockEffects :: IRRep r => DestBlock r n -> EffectRow r n
-destBlockEffects (DestBlock destb block) =
-  ignoreHoistFailure $ hoist destb $ blockEffects block
-
-type NaryTabLamExpr = Abs (Nest SBinder) (Abs (Nest SDecl) CAtom)
-
-fromNaryTabLam :: Int -> CAtom n -> Maybe (Int, NaryTabLamExpr n)
-fromNaryTabLam maxDepth | maxDepth <= 0 = error "expected positive number of args"
-fromNaryTabLam maxDepth = \case
-  SimpInCore (TabLam _ (Abs (b:>IxType ty _) body)) ->
-    extend <|> (Just $ (1, Abs (Nest (b:>ty) Empty) body))
-    where
-      extend = case body of
-        Abs Empty lam | maxDepth > 1 -> do
-          (d, Abs (Nest b2 bs2) body2) <- fromNaryTabLam (maxDepth - 1) lam
-          return $ (d + 1, Abs (Nest (b:>ty) (Nest b2 bs2)) body2)
-        _ -> Nothing
-  _ -> Nothing
-
--- first argument is the number of args expected
-fromNaryTabLamExact :: Int -> CAtom n -> Maybe (NaryTabLamExpr n)
-fromNaryTabLamExact exactDepth _ | exactDepth <= 0 = error "expected positive number of args"
-fromNaryTabLamExact exactDepth lam = do
-  (realDepth, naryLam) <- fromNaryTabLam exactDepth lam
-  guard $ realDepth == exactDepth
-  return naryLam
 
 fromNaryForExpr :: IRRep r => Int -> Expr r n -> Maybe (Int, LamExpr r n)
 fromNaryForExpr maxDepth | maxDepth <= 0 = error "expected non-negative number of args"
 fromNaryForExpr maxDepth = \case
-  PrimOp (Hof (For _ _ (UnaryLamExpr b body))) ->
+  PrimOp (Hof (TypedHof _ (For _ _ (UnaryLamExpr b body)))) ->
     extend <|> (Just $ (1, LamExpr (Nest b Empty) body))
     where
       extend = do
-        expr <- exprBlock body
         guard $ maxDepth > 1
-        (d, LamExpr bs body2) <- fromNaryForExpr (maxDepth - 1) expr
+        (d, LamExpr bs body2) <- fromNaryForExpr (maxDepth - 1) body
         return (d + 1, LamExpr (Nest b bs) body2)
   _ -> Nothing
-
-mkConsListTy :: [Type r n] -> Type r n
-mkConsListTy = foldr PairTy UnitTy
-
-mkConsList :: [Atom r n] -> Atom r n
-mkConsList = foldr PairVal UnitVal
-
-fromConsListTy :: (IRRep r, Fallible m) => Type r n -> m [Type r n]
-fromConsListTy ty = case ty of
-  UnitTy         -> return []
-  PairTy t rest -> (t:) <$> fromConsListTy rest
-  _              -> throw CompilerErr $ "Not a pair or unit: " ++ show ty
-
--- ((...((ans & x{n}) & x{n-1})... & x2) & x1) -> (ans, [x1, ..., x{n}])
-fromLeftLeaningConsListTy :: (IRRep r, Fallible m) => Int -> Type r n -> m (Type r n, [Type r n])
-fromLeftLeaningConsListTy depth initTy = go depth initTy []
-  where
-    go 0        ty xs = return (ty, reverse xs)
-    go remDepth ty xs = case ty of
-      PairTy lt rt -> go (remDepth - 1) lt (rt : xs)
-      _ -> throw CompilerErr $ "Not a pair: " ++ show xs
-
-fromConsList :: (IRRep r, Fallible m) => Atom r n -> m [Atom r n]
-fromConsList xs = case xs of
-  UnitVal        -> return []
-  PairVal x rest -> (x:) <$> fromConsList rest
-  _              -> throw CompilerErr $ "Not a pair or unit: " ++ show xs
 
 type BundleDesc = Int  -- length
 
@@ -551,16 +420,10 @@ bundleFold emptyVal pair els = case els of
     where (tb, td) = bundleFold emptyVal pair t
 
 mkBundleTy :: [Type r n] -> (Type r n, BundleDesc)
-mkBundleTy = bundleFold UnitTy PairTy
+mkBundleTy = bundleFold UnitTy (\x y -> TyCon (ProdType [x, y]))
 
 mkBundle :: [Atom r n] -> (Atom r n, BundleDesc)
-mkBundle = bundleFold UnitVal PairVal
-
-trySelectBranch :: IRRep r => Atom r n -> Maybe (Int, Atom r n)
-trySelectBranch e = case e of
-  SumVal _ i value -> Just (i, value)
-  NewtypeCon con e' | isSumCon con -> trySelectBranch e'
-  _ -> Nothing
+mkBundle = bundleFold UnitVal (\x y -> Con (ProdCon [x, y]))
 
 freeAtomVarsList :: forall r e n. (IRRep r, HoistableE e) => e n -> [Name (AtomNameC r) n]
 freeAtomVarsList = freeVarsList
@@ -571,5 +434,3 @@ freshNameM hint = do
   Distinct <- getDistinct
   return $ withFresh hint scope \b -> Abs b (binderName b)
 {-# INLINE freshNameM #-}
-
-type AtomNameMap r = NameMap (AtomNameC r)

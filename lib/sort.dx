@@ -12,26 +12,26 @@ it's doing bubble / insertion sort with quadratic time cost.
 However, if it breaks the list in half recursively, it'll be doing parallel mergesort.
 Currently the Dex compiler will do the quadratic-time version.
 
-def concat_table(leftin: a=>v, rightin: b=>v) -> (Either a b=>v) given (a|Ix, b|Ix, v) =
+def concat_table(leftin: a=>v, rightin: b=>v) -> (Either a b=>v) given (a|Ix, b|Ix, v:Type) =
   for idx. case idx of
     Left i  -> leftin[i]
     Right i -> rightin[i]
 
 def merge_sorted_tables(xs:m=>a, ys:n=>a) -> (Either m n=>a) given (a|Ord, m|Ix, n|Ix) =
-  -- Possible improvements:
-  --  1) Using a SortedTable type.
-  --  2) Avoid needlessly initializing the return array.
-  init = concat_table xs ys  -- Initialize array of correct size.
+  # Possible improvements:
+  #  1) Using a SortedTable type.
+  #  2) Avoid needlessly initializing the return array.
+  init = concat_table xs ys  # Initialize array of correct size.
   yield_state init \buf.
     with_state (0, 0) \countrefs.
       for i:(Either m n).
         (cur_x, cur_y) = get countrefs
-        if cur_y >= size n  -- no ys left
+        if cur_y >= size n  # no ys left
           then
             countrefs := (cur_x + 1, cur_y)
             buf!i := xs[unsafe_from_ordinal cur_x]
           else
-            if cur_x < size m -- still xs left
+            if cur_x < size m # still xs left
               then
                 if xs[unsafe_from_ordinal cur_x] <= ys[unsafe_from_ordinal cur_y]
                   then
@@ -42,25 +42,19 @@ def merge_sorted_tables(xs:m=>a, ys:n=>a) -> (Either m n=>a) given (a|Ord, m|Ix,
                     buf!i := ys[unsafe_from_ordinal cur_y]
 
 def merge_sorted_lists(lx: List a, ly: List a) -> List a given (a|Ord) =
-  -- Need this wrapper because Dex can't automatically weaken
-  -- (a | b)=>c to ((Fin d)=>c)
+  # Need this wrapper because Dex can't automatically weaken
+  # (a | b)=>c to ((Fin d)=>c)
   AsList(nx, xs) = lx
   AsList(ny, ys) = ly
   sorted = merge_sorted_tables xs ys
   newsize = nx + ny
   AsList _ $ unsafe_cast_table(to=Fin newsize, sorted)
 
+# Warning: Has quadratic runtime cost for now.
 def sort(xs: n=>a) -> n=>a given (n|Ix, a|Ord) =
-  -- Warning: Has quadratic runtime cost for now.
-
-  xlists = for i:n. (AsList 1 [xs[i]])
-
-  -- Merge sort monoid:
-  mempty = AsList 0 []
-  mcombine = merge_sorted_lists
-
-  -- reduce might someday recursively subdivide the problem.
-  AsList(_, r) = reduce mempty mcombine xlists
+  xlists = each xs \x. to_list([x])
+  # reduce might someday recursively subdivide the problem.
+  AsList(_, r) = reduce xlists mempty merge_sorted_lists
   unsafe_cast_table(to=n, r)
 
 def (+|)(i:n, delta:Nat) -> n  given (n|Ix) =
@@ -68,4 +62,4 @@ def (+|)(i:n, delta:Nat) -> n  given (n|Ix) =
   from_ordinal $ select (i' >= size n) (size n -| 1) i'
 
 def is_sorted(xs:n=>a) -> Bool given (a|Ord, n|Ix) =
-  all for i. xs[i] <= xs[i +| 1]
+  all for i:n. xs[i] <= xs[i +| 1]

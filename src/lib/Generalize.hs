@@ -7,44 +7,46 @@
 module Generalize (generalizeArgs, generalizeIxDict) where
 
 import Control.Monad
+import Data.Maybe (fromJust)
 
-import CheckType (isData)
 import Core
 import Err
+import PPrint
 import Types.Core
 import Inference
 import IRVariants
 import QueryType
 import Name
 import Subst
-import MTL1
 import Types.Primitives
+import Types.Top
 
-generalizeIxDict :: EnvReader m => Atom CoreIR n -> m n (Generalized CoreIR CAtom n)
+type RolePiBinder = WithAttrB RoleExpl CBinder
+type RolePiBinders = Nest RolePiBinder
+
+generalizeIxDict :: EnvReader m => CDict n -> m n (Generalized CoreIR CDict n)
 generalizeIxDict dict = liftGeneralizerM do
   dict' <- sinkM dict
-  dictTy <- getType dict'
+  dictTy <- return $ getType dict'
   dictTyGeneralized <- generalizeType dictTy
-  dictGeneralized <- liftEnvReaderM $ generalizeDict dictTyGeneralized dict'
-  return dictGeneralized
--- {-# INLINE generalizeIxDict #-}
+  liftEnvReaderM $ generalizeDict dictTyGeneralized dict'
+{-# INLINE generalizeIxDict #-}
 
 generalizeArgs ::EnvReader m => CorePiType n -> [Atom CoreIR n] -> m n (Generalized CoreIR (ListE CAtom) n)
 generalizeArgs fTy argsTop = liftGeneralizerM $ runSubstReaderT idSubst do
-  PairE (CorePiType _ bs _ _) (ListE argsTop') <- sinkM $ PairE fTy (ListE argsTop)
-  ListE <$> go bs argsTop'
+  PairE (CorePiType _ expls bs _) (ListE argsTop') <- sinkM $ PairE fTy (ListE argsTop)
+  ListE <$> go (zipAttrs expls bs) argsTop'
   where
-    go :: Nest (WithExpl CBinder) i i' -> [Atom CoreIR n]
+    go :: Nest (WithAttrB Explicitness CBinder) i i' -> [Atom CoreIR n]
        -> SubstReaderT AtomSubstVal GeneralizerM i n [Atom CoreIR n]
-    go (Nest (WithExpl expl b) bs) (arg:args) = do
+    go (Nest (WithAttrB expl b) bs) (arg:args) = do
       ty' <- substM $ binderType b
-      arg' <- case (ty', expl) of
-        (TyKind, _) -> liftSubstReaderT case arg of
-          Type t -> Type <$> generalizeType t
-          _ -> error "not a type"
-        (DictTy _, Inferred Nothing (Synth _)) -> generalizeDict ty' arg
+      arg' <- liftSubstReaderT case (ty', expl) of
+        (TyKind, _) -> toAtom <$> generalizeType (fromJust $ toMaybeType arg)
+        (TyCon (DictTy _), Inferred Nothing (Synth _)) ->
+          toAtom <$> generalizeDict ty' (fromJust $ toMaybeDict arg)
         _ -> isData ty' >>= \case
-          True -> liftM Var $ liftSubstReaderT $ emitGeneralizationParameter ty' arg
+          True -> toAtom <$> emitGeneralizationParameter ty' arg
           False -> do
             -- Unlike in `inferRoles` in `Inference`, it's ok to have non-data,
             -- non-type, non-dict arguments (e.g. a function). We just don't
@@ -90,7 +92,7 @@ liftGeneralizerM cont = do
 {-# INLINE liftGeneralizerM #-}
 
 -- XXX: the supplied type may be more general than the type of the atom!
-emitGeneralizationParameter :: Type CoreIR n -> Atom CoreIR n -> GeneralizerM n (AtomName CoreIR n)
+emitGeneralizationParameter :: Type CoreIR n -> Atom CoreIR n -> GeneralizerM n (AtomVar CoreIR n)
 emitGeneralizationParameter ty val = GeneralizerM do
   Abs b v <- return $ newName noHint
   let emission = Abs (RNest REmpty (GeneralizationEmission (b:>ty) val)) v
@@ -99,18 +101,16 @@ emitGeneralizationParameter ty val = GeneralizerM do
     -- dependent pair binders). As long as those variables are only used in
     -- DataParam roles, this hoisting should succeed.
     Nothing -> error $ "expected atom to be hoistable " ++ pprint val
-    Just v' -> return v'
+    Just v' -> return $ AtomVar v' ty
 
 -- === actual generalization traversal ===
 
 -- Given a type (an Atom of type `Type`), abstracts over all data components
 generalizeType :: Type CoreIR n -> GeneralizerM n (Type CoreIR n)
 generalizeType ty = traverseTyParams ty \paramRole paramReqTy param -> case paramRole of
-  TypeParam -> Type <$> case param of
-    Type t -> generalizeType t
-    _ -> error "not a type"
-  DictParam -> generalizeDict paramReqTy param
-  DataParam -> Var <$> emitGeneralizationParameter paramReqTy param
+  TypeParam -> toAtom <$> generalizeType (fromJust $ toMaybeType param)
+  DictParam -> toAtom <$> generalizeDict paramReqTy (fromJust $ toMaybeDict param)
+  DataParam -> toAtom <$> emitGeneralizationParameter paramReqTy param
 
 -- === role-aware type traversal ===
 
@@ -123,27 +123,28 @@ traverseTyParams
   => CType n
   -> (forall l . DExt n l => ParamRole -> CType l -> CAtom l -> m l (CAtom l))
   -> m n (CType n)
-traverseTyParams ty f = getDistinct >>= \Distinct -> case ty of
-  DictTy (DictType sn name params) -> do
-    Abs paramRoles UnitE <- getClassRoleBinders name
-    params' <- traverseRoleBinders f paramRoles params
-    return $ DictTy $ DictType sn name params'
-  TabPi (TabPiType (b:>(IxType iTy (IxDictAtom d))) resultTy) -> do
+traverseTyParams (StuckTy _ _) _ = error "shouldn't have StuckTy left"
+traverseTyParams (TyCon ty) f = liftM TyCon $ getDistinct >>= \Distinct -> case ty of
+  DictTy dictTy -> DictTy <$> case dictTy of
+    DictType sn name params -> do
+      Abs paramRoles UnitE <- getClassRoleBinders name
+      params' <- traverseRoleBinders f paramRoles params
+      return $ DictType sn name params'
+    IxDictType   t -> IxDictType   <$> f' TypeParam TyKind t
+    DataDictType t -> DataDictType <$> f' TypeParam TyKind t
+  TabPi (TabPiType d (b:>iTy) resultTy) -> do
     iTy' <- f' TypeParam TyKind iTy
-    dictTy <- liftM ignoreExcept $ runFallibleT1 $ DictTy <$> ixDictType iTy'
-    d'   <- f DictParam dictTy d
+    let dictTy = toType $ IxDictType iTy'
+    d' <- fromJust . toMaybeDict <$> f DictParam dictTy (toAtom d)
     withFreshBinder (getNameHint b) iTy' \(b':>_) -> do
       resultTy' <- applyRename (b@>binderName b') resultTy >>= (f' TypeParam TyKind)
-      return $ TabTy (b':>IxType iTy' (IxDictAtom d')) resultTy'
-  -- shouldn't need this once we can exclude IxDictFin and IxDictSpecialized from CoreI
-  TabPi t -> return $ TabPi t
-  TC tc -> TC <$> case tc of
-    BaseType b -> return $ BaseType b
-    ProdType tys -> ProdType <$> forM tys \t -> f' TypeParam TyKind t
-    RefType _ _ -> error "not implemented" -- how should we handle the ParamRole for the heap parameter?
-    SumType  tys -> SumType  <$> forM tys \t -> f' TypeParam TyKind t
-    TypeKind     -> return TypeKind
-    HeapType     -> return HeapType
+      return $ TabPi $ TabPiType d' (b':>iTy') resultTy'
+  BaseType b -> return $ BaseType b
+  ProdType tys -> ProdType <$> forM tys \t -> f' TypeParam TyKind t
+  RefType _ _ -> error "not implemented" -- how should we handle the ParamRole for the heap parameter?
+  SumType  tys -> SumType  <$> forM tys \t -> f' TypeParam TyKind t
+  TypeKind     -> return TypeKind
+  HeapType     -> return HeapType
   NewtypeTyCon con -> NewtypeTyCon <$> case con of
     Nat -> return Nat
     Fin n -> Fin <$> f DataParam NatTy n
@@ -155,11 +156,7 @@ traverseTyParams ty f = getDistinct >>= \Distinct -> case ty of
   _ -> error $ "Not implemented: " ++ pprint ty
   where
     f' :: forall l . DExt n l => ParamRole -> CType l -> CType l -> m l (CType l)
-    f' r t x = fromType <$> f r t (Type x)
-
-    fromType :: CAtom l -> CType l
-    fromType (Type t) = t
-    fromType x = error $ "not a type: " ++ pprint x
+    f' r t x = fromJust <$> toMaybeType <$> f r t (toAtom x)
 {-# INLINE traverseTyParams #-}
 
 traverseRoleBinders
@@ -172,7 +169,7 @@ traverseRoleBinders f allBinders allParams =
     go :: forall i i'. RolePiBinders i i' -> [Atom CoreIR n]
        -> SubstReaderT AtomSubstVal m i n [Atom CoreIR n]
     go Empty [] = return []
-    go (Nest (RolePiBinder role b) bs) (param:params) = do
+    go (Nest (WithAttrB (role, _) b) bs) (param:params) = do
       ty' <- substM $ binderType b
       Distinct <- getDistinct
       param' <- liftSubstReaderT $ f role ty' param
@@ -183,14 +180,14 @@ traverseRoleBinders f allBinders allParams =
 
 getDataDefRoleBinders :: EnvReader m => TyConName n -> m n (Abs RolePiBinders UnitE n)
 getDataDefRoleBinders def = do
-  TyConDef _ bs _ <- lookupTyCon def
-  return $ Abs bs UnitE
+  TyConDef _ attrs bs _ <- lookupTyCon def
+  return $ Abs (zipAttrs attrs bs) UnitE
 {-# INLINE getDataDefRoleBinders #-}
 
 getClassRoleBinders :: EnvReader m => ClassName n -> m n (Abs RolePiBinders UnitE n)
 getClassRoleBinders def = do
-  ClassDef _ _ _ bs _ _ <- lookupClassDef def
-  return $ Abs bs UnitE
+  ClassDef _ _ _ _ roleExpls bs _ _ <- lookupClassDef def
+  return $ Abs (zipAttrs roleExpls bs) UnitE
 {-# INLINE getClassRoleBinders #-}
 
 -- === instances ===

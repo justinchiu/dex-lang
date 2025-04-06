@@ -20,6 +20,7 @@ import Occurrence hiding (Var)
 import Occurrence qualified as Occ
 import Types.Core
 import Types.Primitives
+import Types.Top
 import QueryType
 
 -- === External API ===
@@ -28,13 +29,9 @@ import QueryType
 -- annotation holding a summary of how that binding is used.  It also eliminates
 -- unused pure bindings as it goes, since it has all the needed information.
 
-analyzeOccurrences :: EnvReader m => SLam n -> m n (SLam n)
-analyzeOccurrences = liftLamExpr analyzeOccurrencesBlock
+analyzeOccurrences :: EnvReader m => TopLam SimpIR n -> m n (TopLam SimpIR n)
+analyzeOccurrences lam = liftLamExpr lam \e -> liftOCCM $ occ accessOnce e
 {-# INLINE analyzeOccurrences #-}
-
-analyzeOccurrencesBlock :: EnvReader m => SBlock n -> m n (SBlock n)
-analyzeOccurrencesBlock = liftOCCM . occ accessOnce
-{-# SCC analyzeOccurrencesBlock #-}
 
 -- === Overview ===
 
@@ -144,12 +141,26 @@ countFreeVarsAsOccurrencesB obj =
   forM_ (freeAtomVarsList $ Abs obj UnitE) \name -> do
     modify (<> FV (singletonNameMapE name $ AccessInfo One accessOnce))
 
--- Run the given action with its own FV state, and return the FVs it
--- accumulates for post-processing.
-isolated :: OCCM n a -> OCCM n (a, FV n)
-isolated action = do
+-- Run the given action with its own FV state, and return the FVs it accumulates
+-- for post-processing.  Merging them back in is up to the caller.
+separately :: OCCM n a -> OCCM n (a, FV n)
+separately action = do
   r <- ask
   lift11 $ lift11 $ runStateT1 (runReaderT1 r action) mempty
+
+-- Run the given action with its own FV state, and process its accumulated FVs
+-- before merging.
+censored :: (FV n -> FV n) -> OCCM n a -> OCCM n a
+censored f act = do
+  (a, fvs) <- separately act
+  modify (<> f fvs)
+  return a
+
+-- Run the given action with its own FV state, then merge its accumulated FVs
+-- afterwards.  (This is only meaningful if the action reads the FV state.)
+isolated :: OCCM n a -> OCCM n a
+isolated = censored id
+{-# INLINE isolated #-}
 
 -- Extend the IxExpr environment
 extend :: (BindsOneName b (AtomNameC SimpIR))
@@ -171,8 +182,8 @@ ixExpr name = do
 -- including statically.
 inlinedLater :: (HoistableE e) => e n -> OCCM n (e n)
 inlinedLater obj = do
-  (_, fvs) <- isolated $ countFreeVarsAsOccurrences obj
-  modify (<> useManyTimesStatic (useManyTimes fvs))
+  void $ censored (useManyTimesStatic . useManyTimes)
+    $ countFreeVarsAsOccurrences obj
   return obj
 
 -- === Computing IxExpr summaries ===
@@ -184,17 +195,18 @@ summaryExpr = \case
 
 summary :: SAtom n -> OCCM n (IxExpr n)
 summary atom = case atom of
-  Var name -> ixExpr name
-  Con c -> constructor c
-  _ -> unknown atom
+  Stuck _ stuck -> case stuck of
+    Var v -> ixExpr $ atomVarName v
+    _ -> unknown atom
+  Con c -> case c of
+    -- TODO Represent the actual literal value?
+    Lit _ -> return $ Deterministic []
+    ProdCon elts -> Product <$> mapM summary elts
+    SumCon _ tag payload -> Inject tag <$> summary payload
+    HeapVal -> invalid "HeapVal"
+    DepPair _ _ _ -> error "not implemented"
   where
     invalid tag = error $ "Unexpected indexing by " ++ tag
-    constructor = \case
-      -- TODO Represent the actual literal value?
-      Lit _ -> return $ Deterministic []
-      ProdCon elts -> Product <$> mapM summary elts
-      SumCon _ tag payload -> Inject tag <$> summary payload
-      HeapVal -> invalid "HeapVal"
 
 unknown :: HoistableE e => e n -> OCCM n (IxExpr n)
 unknown _ = return IxAll
@@ -235,14 +247,25 @@ class HasOCC (e::E) where
 
 instance HasOCC SAtom where
   occ a = \case
-    Var n -> do
+    Stuck t e -> Stuck <$> occ a t <*> occ a e
+    Con con -> liftM Con $ runOCCMVisitor a $ visitGeneric con
+
+instance HasOCC SStuck where
+  occ a = \case
+    Var (AtomVar n ty) -> do
       modify (<> FV (singletonNameMapE n $ AccessInfo One a))
-      return $ Var n
-    ProjectElt i x -> ProjectElt i <$> occ a x
-    atom -> runOCCMVisitor a $ visitAtomPartial atom
+      ty' <- occTy ty
+      return $ Var (AtomVar n ty')
+    StuckProject i x -> StuckProject <$> pure i <*> occ a x
+    StuckTabApp array ixs -> do
+      (a', ixs') <- occIdx a ixs
+      array' <- occ a' array
+      return $ StuckTabApp array' ixs'
+    PtrVar t p -> return $ PtrVar t p
+    RepValAtom x -> return $ RepValAtom x
 
 instance HasOCC SType where
-  occ a ty = runOCCMVisitor a $ visitTypePartial ty
+  occ a (TyCon con) = liftM TyCon $ runOCCMVisitor a $ visitGeneric con
 
 -- TODO What, actually, is the right thing to do for type annotations?  Do we
 -- want a rule like "we never inline into type annotations", or such?  For
@@ -258,52 +281,45 @@ instance HasOCC SLam where
     return lam
 
 instance HasOCC (PiType SimpIR) where
-  occ _ (PiType bs effs ty) = do
+  occ _ (PiType bs effTy) = do
     -- The way this and hoistState are written, the pass will crash if any of
     -- the AccessInfos reference this binder.
-    piTy@(PiType bs' _ _) <- refreshAbs (Abs bs (PairE effs ty)) \b (PairE effs' ty') ->
+    piTy@(PiType bs' _) <- refreshAbs (Abs bs effTy) \b effTy' ->
       -- I (dougalm) am not sure about this. I'm just trying to mimic the old
       -- behavior when this would go through the `HasOCC PairE` instance.
-      PiType b <$> occGeneric accessOnce effs' <*> occ accessOnce ty'
+      PiType b <$> occGeneric accessOnce effTy'
     countFreeVarsAsOccurrencesB bs'
     return piTy
 
-instance HasOCC SBlock where
-  occ a (Block ann decls ans) = case (ann, decls) of
-    (NoBlockAnn      , Empty) -> Block NoBlockAnn Empty <$> occ a ans
-    (NoBlockAnn      , _    ) -> error "should be unreachable"
-    (BlockAnn ty effs, _    ) -> do
-      Abs decls' ans' <- occNest a decls ans
-      ty' <- occTy ty
-      countFreeVarsAsOccurrences effs
-      return $ Block (BlockAnn ty' effs) decls' ans'
+instance HasOCC (EffTy SimpIR) where
+  occ _ (EffTy effs ty) = do
+    ty' <- occTy ty
+    countFreeVarsAsOccurrences effs
+    return $ EffTy effs ty'
 
 data ElimResult (n::S) where
-  ElimSuccess :: Abs (Nest SDecl) SAtom n -> ElimResult n
-  ElimFailure :: SDecl n l -> UsageInfo -> Abs (Nest SDecl) SAtom l -> ElimResult n
+  ElimSuccess :: Abs (Nest SDecl) SExpr n -> ElimResult n
+  ElimFailure :: SDecl n l -> UsageInfo -> Abs (Nest SDecl) SExpr l -> ElimResult n
 
-occNest :: Access n -> Nest SDecl n l -> SAtom l
-        -> OCCM n (Abs (Nest SDecl) SAtom n)
-occNest a decls ans = case decls of
+occNest :: Access n -> Abs (Nest SDecl) SExpr n
+        -> OCCM n (Abs (Nest SDecl) SExpr n)
+occNest a (Abs decls ans) = case decls of
   Empty -> Abs Empty <$> occ a ans
   Nest d@(Let _ binding) ds -> do
-    isPureDecl <- isPure binding
+    isPureDecl <- return $ isPure binding
     dceAttempt <- refreshAbs (Abs d (Abs ds ans))
-      \d'@(Let b' (DeclBinding _ _ expr')) (Abs ds' ans') -> do
+      \d'@(Let b' (DeclBinding _ expr')) rest -> do
         exprIx <- summaryExpr $ sink expr'
         extend b' exprIx do
-          below <- occNest (sink a) ds' ans'
-          checkAllFreeVariablesMentioned below
+          below <- isolated $ occNest (sink a) rest >>= wrapWithCachedFVs
           accessInfo <- getAccessInfo $ binderName d'
           let usage = usageInfo accessInfo
           let dceAttempt = case isPureDecl of
-               False -> ElimFailure d' usage below
+               False -> ElimFailure d' usage $ fromCachedFVs below
                True  ->
-                 -- Or hoistUsingCachedFVs in the monad, if we decide to do
-                 -- that optimization
-                 case hoist d' below of
+                 case hoistViaCachedFVs d' below of
                    HoistSuccess below' -> ElimSuccess below'
-                   HoistFailure _ -> ElimFailure d' usage below
+                   HoistFailure _ -> ElimFailure d' usage $ fromCachedFVs below
           return dceAttempt
     case dceAttempt of
       ElimSuccess below' -> return below'
@@ -312,62 +328,67 @@ occNest a decls ans = case decls of
         -- the decl's binder.  This means that variable bindings cut
         -- occurrence analysis, and each binding is considered for
         -- inlining separately.
-        DeclBinding _ ty expr <- occ accessOnce binding'
+        DeclBinding _ expr <- occ accessOnce binding'
         -- We save effects information here because the inliner will want to
         -- query the effects of an expression before it is substituted, and the
         -- type querying subsystem is not set up to do that.
-        effs <- getEffects expr
+        effs <- return $ getEffects expr
         let ann = case effs of
               Pure -> OccInfoPure usage
               _    -> OccInfoImpure usage
-        let binding'' = DeclBinding ann ty expr
+        let binding'' = DeclBinding ann expr
         return $ Abs (Nest (Let b' binding'') ds'') ans''
 
-checkAllFreeVariablesMentioned :: HoistableE e => e n -> OCCM n ()
-checkAllFreeVariablesMentioned e = do
+wrapWithCachedFVs :: forall e n. HoistableE e => e n -> OCCM n (CachedFVs e n)
+wrapWithCachedFVs e = do
+  FV fvMap <- get
+  let fvs = keySetNameMapE fvMap
 #ifdef DEX_DEBUG
-  FV fvs <- get
-  forM_ (nameSetToList (freeVarsE e)) \name ->
-    case lookupNameMapE name fvs of
-      Just _ -> return ()
-      Nothing -> error $ "Free variable map missing free variable " ++ show name
+  let fvsOk = map getRawName (freeVarsList e :: [SAtomName n]) == nameSetRawNames fvs
 #else
-  void $ return e  -- Refer to `e` in this branch to avoid a GHC warning
-  return ()
-{-# INLINE checkAllFreeVariablesMentioned #-}
+  -- Verification of this invariant defeats the performance benefits of
+  -- avoiding the extra traversal (e.g. actually having linear complexity),
+  -- so we only do that in debug builds.
+  let fvsOk = True
 #endif
+  case fvsOk of
+    True -> return $ UnsafeCachedFVs fvs e
+    False -> error $ "Free variables were computed incorrectly."
 
 instance HasOCC (DeclBinding SimpIR) where
-  occ a (DeclBinding ann ty expr) = do
+  occ a (DeclBinding ann expr) = do
     expr' <- occ a expr
-    ty' <- occTy ty
-    return $ DeclBinding ann ty' expr'
+    return $ DeclBinding ann expr'
 
 instance HasOCC SExpr where
   occ a = \case
-    TabApp array ixs -> do
-      (a', ixs') <- go a ixs
+    Block effTy (Abs decls ans) -> do
+      effTy' <- occ a effTy
+      Abs decls' ans' <- occNest a (Abs decls ans)
+      return $ Block effTy' (Abs decls' ans')
+    TabApp t array ix -> do
+      t' <- occTy t
+      (a', ix') <- occIdx a ix
       array' <- occ a' array
-      return $ TabApp array' ixs'
-    Case scrut alts ty effs -> do
+      return $ TabApp t' array' ix'
+    Case scrut alts (EffTy effs ty) -> do
       scrut' <- occ accessOnce scrut
       scrutIx <- summary scrut
-      (alts', innerFVs) <- unzip <$> mapM (isolated . occAlt a scrutIx) alts
+      (alts', innerFVs) <- unzip <$> mapM (separately . occAlt a scrutIx) alts
       modify (<> foldl' Occ.max zero innerFVs)
       ty' <- occTy ty
       countFreeVarsAsOccurrences effs
-      return $ Case scrut' alts' ty' effs
+      return $ Case scrut' alts' (EffTy effs ty')
     PrimOp (Hof op) -> PrimOp . Hof <$> occ a op
     PrimOp (RefOp ref op) -> do
       ref' <- occ a ref
       PrimOp . RefOp ref' <$> occ a op
     expr -> occGeneric a expr
-    where
-      go acc [] = return (acc, [])
-      go acc (ix:ixs) = do
-        (acc', ixs') <- go acc ixs
-        (summ, ix') <- occurrenceAndSummary ix
-        return (location summ acc', ix':ixs')
+
+occIdx :: Access n -> SAtom n -> OCCM n (Access n, SAtom n)
+occIdx acc ix = do
+  (summ, ix') <- occurrenceAndSummary ix
+  return (location summ acc, ix')
 
 -- Arguments: Usage of the return value, summary of the scrutinee, the
 -- alternative itself.
@@ -392,29 +413,25 @@ occurrenceAndSummary atom = do
   ix <- summary atom'
   return (ix, atom')
 
+instance HasOCC (TypedHof SimpIR) where
+  occ a (TypedHof effTy hof) = TypedHof <$> occ a effTy <*> occ a hof
+
 instance HasOCC (Hof SimpIR) where
   occ a hof = case hof of
     For ann ixDict (UnaryLamExpr b body) -> do
       ixDict' <- inlinedLater ixDict
       occWithBinder (Abs b body) \b' body' -> do
         extend b' (Occ.Var $ binderName b') do
-          (body'', bodyFV) <- isolated (occ accessOnce body')
-          modify (<> abstractFor b' bodyFV)
+          body'' <- censored (abstractFor b') (occ accessOnce body')
           return $ For ann ixDict' (UnaryLamExpr b' body'')
     For _ _ _ -> error "For body should be a unary lambda expression"
-    While body -> While <$> do
-      (body', bodyFV) <- isolated (occ accessOnce body)
-      modify (<> useManyTimes bodyFV)
-      return body'
+    While body -> While <$> censored useManyTimes (occ accessOnce body)
     RunReader ini bd -> do
-      ini' <- occ accessOnce ini
       iniIx <- summary ini
-      bd' <- oneShot a [Deterministic [], iniIx]bd
+      bd' <- oneShot a [Deterministic [], iniIx] bd
+      ini' <- occ accessOnce ini
       return $ RunReader ini' bd'
     RunWriter Nothing (BaseMonoid empty combine) bd -> do
-      -- We will process the combining function when we meet it in MExtend ops
-      -- (but we won't attempt to eliminate dead code in it).
-      empty' <- occ accessOnce empty
       -- There is no way to read from the reference in a Writer, so the only way
       -- an indexing expression can depend on it is by referring to the
       -- reference itself.  One way to so refer that is opaque to occurrence
@@ -428,17 +445,20 @@ instance HasOCC (Hof SimpIR) where
       -- different references across loop iterations are not distinguishable.
       -- The same argument holds for the heap parameter.
       bd' <- oneShot a [Deterministic [], Deterministic []] bd
+      -- We will process the combining function when we meet it in MExtend ops
+      -- (but we won't attempt to eliminate dead code in it).
+      empty' <- occ accessOnce empty
       return $ RunWriter Nothing (BaseMonoid empty' combine) bd'
     RunWriter (Just _) _ _ ->
       error "Expecting to do occurrence analysis before destination passing."
     RunState Nothing ini bd -> do
-      ini' <- occ accessOnce ini
       -- If we wanted to be more precise, the summary for the reference should
       -- be something about the stuff that might flow into the `put` operations
       -- affecting that reference.  Using `IxAll` is a conservative
       -- approximation (in downstream analysis it means "assume I touch every
       -- value").
-      bd' <- oneShot a [Deterministic [], IxAll]bd
+      bd' <- oneShot a [Deterministic [], IxAll] bd
+      ini' <- occ accessOnce ini
       return $ RunState Nothing ini' bd'
     RunState (Just _) _ _ ->
       error "Expecting to do occurrence analysis before destination passing."
@@ -449,7 +469,8 @@ instance HasOCC (Hof SimpIR) where
       error "Expecting to do occurrence analysis before lowering."
 
 oneShot :: Access n -> [IxExpr n] -> LamExpr SimpIR n -> OCCM n (LamExpr SimpIR n)
-oneShot acc [] (LamExpr Empty body) = LamExpr Empty <$> occ acc body
+oneShot acc [] (LamExpr Empty body) =
+  LamExpr Empty <$> occ acc body
 oneShot acc (ix:ixs) (LamExpr (Nest b bs) body) = do
   occWithBinder (Abs b (LamExpr bs body)) \b' restLam ->
     extend b' (sink ix) do
@@ -464,29 +485,31 @@ occWithBinder
   -> (forall l. DExt n l => Binder SimpIR n l -> e l -> OCCM l a)
   -> OCCM n a
 occWithBinder (Abs (b:>ty) body) cont = do
-  ty' <- occTy ty
-  refreshAbs (Abs (b:>ty') body) cont
+  (ty', fvs) <- separately $ occTy ty
+  ans <- refreshAbs (Abs (b:>ty') body) cont
+  modify (<> fvs)
+  return ans
 {-# INLINE occWithBinder #-}
 
 instance HasOCC (RefOp SimpIR) where
   occ _ = \case
     MExtend (BaseMonoid empty combine) val -> do
+      valIx <- summary val
+      -- Treat the combining function as inlined here and called once
+      combine' <- oneShot accessOnce [Deterministic [], valIx] combine
       val' <- occ accessOnce val
-      valIx <- summary val'
       -- TODO(precision) The empty value of the monoid is presumably dead here,
       -- but we pretend like it's not to make sure that occurrence analysis
       -- results mention every free variable in the traversed expression.  This
       -- may lead to missing an opportunity to inline something into the empty
       -- value of the given monoid, since references thereto will be overcounted.
       empty' <- occ accessOnce empty
-      -- Treat the combining function as inlined here and called once
-      combine' <- oneShot accessOnce [Deterministic [], valIx] combine
       return $ MExtend (BaseMonoid empty' combine') val'
     -- I'm pretty sure the others are all strict, and not usefully analyzable
     -- for what they do to the incoming access pattern.
     MPut x -> MPut <$> occ accessOnce x
     MGet -> return MGet
     MAsk -> return MAsk
-    IndexRef i -> IndexRef <$> occ accessOnce i
-    ProjRef  i -> return $ ProjRef i
+    IndexRef t i -> IndexRef <$> occTy t <*> occ accessOnce i
+    ProjRef t i -> ProjRef <$> occTy t <*> pure i
   {-# INLINE occ #-}
